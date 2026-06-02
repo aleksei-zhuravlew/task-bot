@@ -1,9 +1,18 @@
 import asyncio
 import logging
+import re
+from datetime import datetime, timedelta
 
-from aiogram import Bot, Dispatcher
+from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.types import (
+    Message,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    CallbackQuery,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+)
 
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
@@ -14,6 +23,8 @@ logging.basicConfig(level=logging.INFO)
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
+
+user_states = {}
 
 scope = [
     "https://spreadsheets.google.com/feeds",
@@ -43,6 +54,10 @@ def is_admin(username):
     return norm_user(username) in get_admins()
 
 
+def active_status(status):
+    return status not in ["✅ Готово", "❌ Отменена"]
+
+
 def find_task(task_id):
     values = sheet.get_all_values()
     for index, row in enumerate(values):
@@ -53,8 +68,59 @@ def find_task(task_id):
     return None, None
 
 
-def active_status(status):
-    return status not in ["✅ Готово", "❌ Отменена"]
+def get_active_tasks_for_user(username):
+    username = norm_user(username)
+    result = []
+
+    for row in sheet.get_all_values()[1:]:
+        while len(row) < 14:
+            row.append("")
+
+        if norm_user(row[2]) == username and active_status(row[6]):
+            result.append(row)
+
+    return result
+
+
+def get_active_tasks():
+    result = []
+
+    for row in sheet.get_all_values()[1:]:
+        while len(row) < 14:
+            row.append("")
+
+        if active_status(row[6]):
+            result.append(row)
+
+    return result
+
+
+def get_review_tasks():
+    return [row for row in get_active_tasks() if row[6] == "⏳ На утверждении"]
+
+
+def get_reassign_tasks():
+    return [row for row in get_active_tasks() if row[6] == "⚠️ Требует переназначения"]
+
+
+def main_menu(username):
+    if is_admin(username):
+        return ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text="📌 Все активные"), KeyboardButton(text="⏳ На утверждении")],
+                [KeyboardButton(text="👥 Переназначение"), KeyboardButton(text="📋 Мои задачи")],
+            ],
+            resize_keyboard=True,
+        )
+
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📋 Мои задачи")],
+            [KeyboardButton(text="📎 Сдать работу"), KeyboardButton(text="⏰ Перенести срок")],
+            [KeyboardButton(text="🆘 Нужна помощь"), KeyboardButton(text="❌ Отказаться")],
+        ],
+        resize_keyboard=True,
+    )
 
 
 def waiting_keyboard(task_id):
@@ -66,11 +132,16 @@ def waiting_keyboard(task_id):
 
 
 def work_keyboard(task_id):
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="📎 Как сдать", callback_data=f"how_submit_{task_id}"),
-        InlineKeyboardButton(text="🆘 Нужна помощь", callback_data=f"help_{task_id}"),
-        InlineKeyboardButton(text="❌ Отказаться", callback_data=f"refuse_{task_id}"),
-    ]])
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="📎 Сдать", callback_data=f"submit_{task_id}"),
+            InlineKeyboardButton(text="🆘 Помощь", callback_data=f"help_{task_id}"),
+            InlineKeyboardButton(text="⏰ Перенести", callback_data=f"move_{task_id}"),
+        ],
+        [
+            InlineKeyboardButton(text="❌ Отказаться", callback_data=f"refuse_{task_id}"),
+        ],
+    ])
 
 
 def review_keyboard(task_id):
@@ -81,8 +152,31 @@ def review_keyboard(task_id):
     ]])
 
 
-def final_keyboard():
-    return None
+def task_action_keyboard(task_id):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="📎 Сдать", callback_data=f"submit_{task_id}"),
+            InlineKeyboardButton(text="⏰ Перенести", callback_data=f"move_{task_id}"),
+        ],
+        [
+            InlineKeyboardButton(text="🆘 Помощь", callback_data=f"help_{task_id}"),
+            InlineKeyboardButton(text="❌ Отказаться", callback_data=f"refuse_{task_id}"),
+        ],
+    ])
+
+
+def move_request_keyboard(task_id):
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Одобрить перенос", callback_data=f"approve_move_{task_id}"),
+        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"deny_move_{task_id}"),
+    ]])
+
+
+def reassign_keyboard(task_id):
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🔄 Переназначить", callback_data=f"reassign_{task_id}"),
+        InlineKeyboardButton(text="🗑️ Отменить", callback_data=f"cancel_{task_id}"),
+    ]])
 
 
 def make_task_text(task_id, row):
@@ -100,7 +194,7 @@ def make_task_text(task_id, row):
         text += f"\nРезультат: {row[7]}"
 
     if row[8]:
-        text += f"\nПравки: {row[8]}"
+        text += f"\nКомментарий: {row[8]}"
 
     return text
 
@@ -110,30 +204,107 @@ async def update_card(task_id, row, keyboard=None):
     message_id = row[13]
 
     if chat_id and message_id:
-        await bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=int(message_id),
-            text=make_task_text(task_id, row),
-            reply_markup=keyboard,
-        )
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=int(message_id),
+                text=make_task_text(task_id, row),
+                reply_markup=keyboard,
+            )
+        except Exception:
+            pass
+
+
+async def notify_creator(row, text, keyboard=None):
+    creator_username = norm_user(row[1])
+    # Telegram не позволяет писать по username без user_id.
+    # Пока уведомление дублируем в чат карточки.
+    chat_id = row[12]
+    if chat_id:
+        await bot.send_message(chat_id, text, reply_markup=keyboard)
+
+
+def parse_free_task(text):
+    assignee_match = re.search(r"@[\w\d_]+", text)
+    link_match = re.search(r"https?://\S+", text)
+
+    if not assignee_match:
+        return None
+
+    assignee = assignee_match.group(0)
+    link = link_match.group(0) if link_match else ""
+
+    deadline = "не указан"
+
+    today = datetime.now()
+
+    if "сегодня" in text.lower():
+        deadline = today.strftime("%d.%m")
+    elif "завтра" in text.lower():
+        deadline = (today + timedelta(days=1)).strftime("%d.%m")
+    else:
+        date_match = re.search(r"\b\d{1,2}\.\d{1,2}(?:\.\d{4})?\b", text)
+        if date_match:
+            deadline = date_match.group(0)
+
+    description = text
+    description = description.replace(assignee, "")
+    if link:
+        description = description.replace(link, "")
+    description = re.sub(r"\b(до|к|дедлайн|задача|для)\b", "", description, flags=re.IGNORECASE)
+    description = re.sub(r"\s+", " ", description).strip(" :-—")
+
+    return assignee, description, deadline, link
+
+
+async def create_task_from_parts(message, assignee, description, deadline, link):
+    task_id = len(sheet.get_all_values())
+
+    row = [
+        task_id,
+        norm_user(message.from_user.username),
+        assignee,
+        description,
+        deadline,
+        link,
+        "❓ Ожидает подтверждения",
+        "",
+        "",
+        datetime.now().strftime("%d.%m.%Y %H:%M"),
+        datetime.now().strftime("%d.%m.%Y %H:%M"),
+        "нет",
+        "",
+        "",
+    ]
+
+    sheet.append_row(row)
+
+    sent = await message.answer(
+        make_task_text(task_id, [str(x) for x in row]),
+        reply_markup=waiting_keyboard(task_id),
+    )
+
+    row_number, saved_row = find_task(task_id)
+    sheet.update_cell(row_number, 13, sent.chat.id)
+    sheet.update_cell(row_number, 14, sent.message_id)
+
+    return task_id
 
 
 @dp.message(Command("start"))
 async def start(message: Message):
-    await message.answer("Бот запущен ✅")
+    await message.answer(
+        "Кабинет открыт ✅",
+        reply_markup=main_menu(message.from_user.username),
+    )
 
 
 @dp.message(Command("задача"))
-async def create_task(message: Message):
+async def create_task_command(message: Message):
     text = message.text.replace("/задача", "").strip()
-
-    if not text:
-        await message.answer("Пример:\n/задача @user Сделать обложку | 09.06 | ссылка")
-        return
 
     try:
         parts = text.split("|")
-
         left = parts[0].strip()
         deadline = parts[1].strip()
         link = parts[2].strip()
@@ -142,139 +313,153 @@ async def create_task(message: Message):
         assignee = words[0]
         description = " ".join(words[1:])
 
-        task_id = len(sheet.get_all_values())
+        await create_task_from_parts(message, assignee, description, deadline, link)
 
-        row = [
-            task_id,
-            norm_user(message.from_user.username),
-            assignee,
-            description,
-            deadline,
-            link,
-            "❓ Ожидает подтверждения",
-            "",
-            "",
-            "",
-            "",
-            "нет",
-            "",
-            "",
-        ]
-
-        sheet.append_row(row)
-
-        sent = await message.answer(
-            make_task_text(task_id, [str(x) for x in row]),
-            reply_markup=waiting_keyboard(task_id),
+    except Exception:
+        await message.answer(
+            "Не понял задачу.\n\n"
+            "Формат:\n"
+            "/задача @user описание | 09.06 | ссылка\n\n"
+            "Или свободно:\n"
+            "@user сделать обложку до завтра https://..."
         )
 
-        row_number, saved_row = find_task(task_id)
-        sheet.update_cell(row_number, 13, sent.chat.id)
-        sheet.update_cell(row_number, 14, sent.message_id)
 
-    except Exception as e:
-        await message.answer(f"Ошибка: {e}")
-
-
+@dp.message(F.text == "📋 Мои задачи")
 @dp.message(Command("мои"))
 async def my_tasks(message: Message):
-    username = norm_user(message.from_user.username)
+    tasks = get_active_tasks_for_user(message.from_user.username)
 
-    values = sheet.get_all_values()[1:]
-    result = "📋 Твои активные задачи:\n\n"
-    found = False
-
-    for row in values:
-        while len(row) < 14:
-            row.append("")
-
-        assignee = norm_user(row[2])
-
-        if assignee == username and active_status(row[6]):
-            found = True
-            result += (
-                f"#{row[0]} — {row[3]}\n"
-                f"Дедлайн: {row[4]}\n"
-                f"Статус: {row[6]}\n"
-                f"Материал: {row[5]}\n\n"
-            )
-
-    if not found:
-        result = "У тебя нет активных задач ✅"
-
-    await message.answer(result)
-
-
-@dp.message(Command("сдать"))
-async def submit_by_command(message: Message):
-    text = message.text.replace("/сдать", "").strip()
-    parts = text.split(maxsplit=1)
-
-    if len(parts) < 2:
-        await message.answer("Формат:\n/сдать 3 https://ссылка-на-результат")
+    if not tasks:
+        await message.answer("У тебя нет активных задач ✅")
         return
 
-    task_id = parts[0]
-    result_link = parts[1]
+    for row in tasks:
+        await message.answer(
+            make_task_text(row[0], row),
+            reply_markup=task_action_keyboard(row[0]),
+        )
 
-    row_number, row = find_task(task_id)
 
-    if not row:
-        await message.answer("Задача не найдена")
+@dp.message(F.text == "📌 Все активные")
+async def all_active(message: Message):
+    if not is_admin(message.from_user.username):
         return
 
-    username = norm_user(message.from_user.username)
-    assignee = norm_user(row[2])
+    tasks = get_active_tasks()
 
-    if username != assignee:
-        await message.answer("Сдать задачу может только исполнитель")
+    if not tasks:
+        await message.answer("Активных задач нет ✅")
         return
 
-    if row[6] not in ["🔄 В работе", "✏️ На доработке"]:
-        await message.answer("Эту задачу сейчас нельзя сдать")
+    text = "📌 Все активные задачи:\n\n"
+    for row in tasks:
+        text += f"#{row[0]} — {row[2]} — {row[3]} — {row[4]} — {row[6]}\n"
+
+    await message.answer(text)
+
+
+@dp.message(F.text == "⏳ На утверждении")
+async def review_list(message: Message):
+    if not is_admin(message.from_user.username):
         return
 
-    sheet.update_cell(row_number, 7, "⏳ На утверждении")
-    sheet.update_cell(row_number, 8, result_link)
+    tasks = get_review_tasks()
 
-    _, updated_row = find_task(task_id)
-
-    await update_card(task_id, updated_row, review_keyboard(task_id))
-    await message.answer(f"✅ Задача #{task_id} отправлена на утверждение")
-
-
-@dp.message(Command("правки"))
-async def rework_by_command(message: Message):
-    text = message.text.replace("/правки", "").strip()
-    parts = text.split(maxsplit=1)
-
-    if len(parts) < 2:
-        await message.answer("Формат:\n/правки 3 Что нужно исправить")
+    if not tasks:
+        await message.answer("Нет задач на утверждении ✅")
         return
 
-    task_id = parts[0]
-    comment = parts[1]
+    for row in tasks:
+        await message.answer(make_task_text(row[0], row), reply_markup=review_keyboard(row[0]))
 
-    row_number, row = find_task(task_id)
 
-    if not row:
-        await message.answer("Задача не найдена")
+@dp.message(F.text == "👥 Переназначение")
+async def reassign_list(message: Message):
+    if not is_admin(message.from_user.username):
         return
 
-    username = norm_user(message.from_user.username)
-    creator = norm_user(row[1])
+    tasks = get_reassign_tasks()
 
-    if username != creator and not is_admin(username):
-        await message.answer("Правки может отправить только автор задачи или админ")
+    if not tasks:
+        await message.answer("Нет задач на переназначение ✅")
         return
 
-    sheet.update_cell(row_number, 7, "✏️ На доработке")
-    sheet.update_cell(row_number, 9, comment)
+    for row in tasks:
+        await message.answer(make_task_text(row[0], row), reply_markup=reassign_keyboard(row[0]))
 
-    _, updated_row = find_task(task_id)
 
-    await update_card(task_id, updated_row, work_keyboard(task_id))
-    await message.answer(f"✏️ Задача #{task_id} отправлена на доработку")
+@dp.message(F.text == "📎 Сдать работу")
+async def choose_submit(message: Message):
+    tasks = get_active_tasks_for_user(message.from_user.username)
+    tasks = [t for t in tasks if t[6] in ["🔄 В работе", "✏️ На доработке"]]
+
+    if not tasks:
+        await message.answer("Нет задач, которые можно сдать")
+        return
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=f"📎 Сдать #{row[0]} — {row[3][:25]}", callback_data=f"submit_{row[0]}")]
+            for row in tasks
+        ]
+    )
+
+    await message.answer("Выбери задачу:", reply_markup=keyboard)
+
+
+@dp.message(F.text == "⏰ Перенести срок")
+async def choose_move(message: Message):
+    tasks = get_active_tasks_for_user(message.from_user.username)
+
+    if not tasks:
+        await message.answer("У тебя нет активных задач")
+        return
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=f"⏰ Перенести #{row[0]} — {row[3][:25]}", callback_data=f"move_{row[0]}")]
+            for row in tasks
+        ]
+    )
+
+    await message.answer("Выбери задачу:", reply_markup=keyboard)
+
+
+@dp.message(F.text == "🆘 Нужна помощь")
+async def choose_help(message: Message):
+    tasks = get_active_tasks_for_user(message.from_user.username)
+
+    if not tasks:
+        await message.answer("У тебя нет активных задач")
+        return
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=f"🆘 Помощь #{row[0]} — {row[3][:25]}", callback_data=f"help_{row[0]}")]
+            for row in tasks
+        ]
+    )
+
+    await message.answer("Выбери задачу:", reply_markup=keyboard)
+
+
+@dp.message(F.text == "❌ Отказаться")
+async def choose_refuse(message: Message):
+    tasks = get_active_tasks_for_user(message.from_user.username)
+
+    if not tasks:
+        await message.answer("У тебя нет активных задач")
+        return
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=f"❌ Отказ #{row[0]} — {row[3][:25]}", callback_data=f"refuse_{row[0]}")]
+            for row in tasks
+        ]
+    )
+
+    await message.answer("Выбери задачу:", reply_markup=keyboard)
 
 
 @dp.callback_query(lambda c: c.data.startswith("take_"))
@@ -293,11 +478,8 @@ async def take_task(callback: CallbackQuery):
         await callback.answer("Эту задачу может взять только исполнитель", show_alert=True)
         return
 
-    if row[6] == "🔄 В работе":
-        await callback.answer("Задача уже в работе", show_alert=True)
-        return
-
     sheet.update_cell(row_number, 7, "🔄 В работе")
+    sheet.update_cell(row_number, 11, datetime.now().strftime("%d.%m.%Y %H:%M"))
 
     _, updated_row = find_task(task_id)
 
@@ -309,14 +491,60 @@ async def take_task(callback: CallbackQuery):
     await callback.answer("Задача взята ✅")
 
 
-@dp.callback_query(lambda c: c.data.startswith("how_submit_"))
-async def how_submit(callback: CallbackQuery):
-    task_id = callback.data.split("_")[2]
+@dp.callback_query(lambda c: c.data.startswith("submit_"))
+async def submit_task(callback: CallbackQuery):
+    task_id = callback.data.split("_")[1]
+    user_states[callback.from_user.id] = {"action": "submit", "task_id": task_id}
 
-    await callback.answer(
-        f"Чтобы сдать работу, напиши:\n/сдать {task_id} ссылка",
-        show_alert=True,
+    await callback.message.answer(
+        f"Пришли ссылку на результат по задаче #{task_id}"
     )
+    await callback.answer()
+
+
+@dp.callback_query(lambda c: c.data.startswith("move_"))
+async def move_deadline(callback: CallbackQuery):
+    task_id = callback.data.split("_")[1]
+    user_states[callback.from_user.id] = {"action": "move", "task_id": task_id}
+
+    await callback.message.answer(
+        f"Напиши новый срок и причину переноса для задачи #{task_id}.\n\n"
+        f"Например:\n15.06 — жду материал"
+    )
+    await callback.answer()
+
+
+@dp.callback_query(lambda c: c.data.startswith("refuse_") or c.data.startswith("decline_"))
+async def refuse_task(callback: CallbackQuery):
+    task_id = callback.data.split("_")[1]
+    user_states[callback.from_user.id] = {"action": "refuse", "task_id": task_id}
+
+    await callback.message.answer(
+        f"Напиши причину отказа от задачи #{task_id}"
+    )
+    await callback.answer()
+
+
+@dp.callback_query(lambda c: c.data.startswith("help_"))
+async def help_task(callback: CallbackQuery):
+    task_id = callback.data.split("_")[1]
+    row_number, row = find_task(task_id)
+
+    if not row:
+        await callback.answer("Задача не найдена", show_alert=True)
+        return
+
+    await callback.message.answer(
+        f"🆘 Задаче #{task_id} {row[2]} нужна помощь.\n"
+        f"Описание: {row[3]}"
+    )
+
+    await notify_creator(
+        row,
+        f"🆘 {row[2]} просит помощь по задаче #{task_id}\n\n{row[3]}"
+    )
+
+    await callback.answer("Запрос отправлен")
 
 
 @dp.callback_query(lambda c: c.data.startswith("accept_"))
@@ -336,14 +564,11 @@ async def accept_task(callback: CallbackQuery):
         return
 
     sheet.update_cell(row_number, 7, "✅ Готово")
+    sheet.update_cell(row_number, 11, datetime.now().strftime("%d.%m.%Y %H:%M"))
 
     _, updated_row = find_task(task_id)
 
-    await callback.message.edit_text(
-        make_task_text(task_id, updated_row),
-        reply_markup=final_keyboard(),
-    )
-
+    await callback.message.edit_text(make_task_text(task_id, updated_row))
     await callback.message.answer(f"✅ Задача #{task_id} выполнена")
     await callback.answer("Принято ✅")
 
@@ -351,11 +576,12 @@ async def accept_task(callback: CallbackQuery):
 @dp.callback_query(lambda c: c.data.startswith("rework_"))
 async def rework_task(callback: CallbackQuery):
     task_id = callback.data.split("_")[1]
+    user_states[callback.from_user.id] = {"action": "rework", "task_id": task_id}
 
-    await callback.answer(
-        f"Чтобы отправить правки, напиши:\n/правки {task_id} текст правок",
-        show_alert=True,
+    await callback.message.answer(
+        f"Напиши комментарий правок для задачи #{task_id}"
     )
+    await callback.answer()
 
 
 @dp.callback_query(lambda c: c.data.startswith("cancel_"))
@@ -375,58 +601,188 @@ async def cancel_task(callback: CallbackQuery):
         return
 
     sheet.update_cell(row_number, 7, "❌ Отменена")
+    sheet.update_cell(row_number, 11, datetime.now().strftime("%d.%m.%Y %H:%M"))
 
     _, updated_row = find_task(task_id)
 
-    await callback.message.edit_text(
-        make_task_text(task_id, updated_row),
-        reply_markup=final_keyboard(),
-    )
-
+    await callback.message.edit_text(make_task_text(task_id, updated_row))
     await callback.message.answer(f"❌ Задача #{task_id} отменена")
     await callback.answer("Отменено")
 
 
-@dp.callback_query(lambda c: c.data.startswith("help_"))
-async def help_task(callback: CallbackQuery):
-    task_id = callback.data.split("_")[1]
+@dp.callback_query(lambda c: c.data.startswith("approve_move_"))
+async def approve_move(callback: CallbackQuery):
+    task_id = callback.data.split("_")[2]
     row_number, row = find_task(task_id)
 
-    if not row:
-        await callback.answer("Задача не найдена", show_alert=True)
+    if not is_admin(callback.from_user.username):
+        await callback.answer("Только админ может одобрить перенос", show_alert=True)
         return
 
-    await callback.message.answer(
-        f"🆘 Задаче #{task_id} {row[2]} нужна помощь. Кто может подключиться?"
-    )
-    await callback.answer("Сообщение отправлено")
+    comment = row[8]
+    date_match = re.search(r"\b\d{1,2}\.\d{1,2}(?:\.\d{4})?\b", comment)
 
-
-@dp.callback_query(lambda c: c.data.startswith("refuse_") or c.data.startswith("decline_"))
-async def refuse_task(callback: CallbackQuery):
-    task_id = callback.data.split("_")[1]
-    row_number, row = find_task(task_id)
-
-    if not row:
-        await callback.answer("Задача не найдена", show_alert=True)
+    if not date_match:
+        await callback.answer("Не нашёл новую дату в комментарии", show_alert=True)
         return
 
-    sheet.update_cell(row_number, 7, "⚠️ Требует переназначения")
+    new_deadline = date_match.group(0)
+
+    sheet.update_cell(row_number, 5, new_deadline)
+    sheet.update_cell(row_number, 11, datetime.now().strftime("%d.%m.%Y %H:%M"))
 
     _, updated_row = find_task(task_id)
+    await update_card(task_id, updated_row, work_keyboard(task_id))
 
-    await callback.message.edit_text(
-        make_task_text(task_id, updated_row),
-        reply_markup=None,
+    await callback.message.answer(f"✅ Перенос задачи #{task_id} одобрен. Новый срок: {new_deadline}")
+    await callback.answer("Одобрено")
+
+
+@dp.callback_query(lambda c: c.data.startswith("deny_move_"))
+async def deny_move(callback: CallbackQuery):
+    task_id = callback.data.split("_")[2]
+
+    if not is_admin(callback.from_user.username):
+        await callback.answer("Только админ может отклонить перенос", show_alert=True)
+        return
+
+    await callback.message.answer(f"❌ Перенос задачи #{task_id} отклонён")
+    await callback.answer("Отклонено")
+
+
+@dp.callback_query(lambda c: c.data.startswith("reassign_"))
+async def reassign(callback: CallbackQuery):
+    task_id = callback.data.split("_")[1]
+    user_states[callback.from_user.id] = {"action": "reassign", "task_id": task_id}
+
+    await callback.message.answer(
+        f"Напиши нового исполнителя для задачи #{task_id} в формате @username"
     )
-
-    await callback.message.answer(f"⚠️ Задача #{task_id} требует переназначения")
-    await callback.answer("Отказ зафиксирован")
+    await callback.answer()
 
 
-@dp.callback_query(lambda c: c.data.startswith("move_"))
-async def move_deadline(callback: CallbackQuery):
-    await callback.answer("Сдвиг дедлайна добавим следующим шагом", show_alert=True)
+@dp.message()
+async def text_handler(message: Message):
+    state = user_states.get(message.from_user.id)
+
+    if state:
+        task_id = state["task_id"]
+        action = state["action"]
+        row_number, row = find_task(task_id)
+
+        if not row:
+            await message.answer("Задача не найдена")
+            user_states.pop(message.from_user.id, None)
+            return
+
+        username = norm_user(message.from_user.username)
+        assignee = norm_user(row[2])
+        creator = norm_user(row[1])
+
+        if action == "submit":
+            if username != assignee:
+                await message.answer("Сдать задачу может только исполнитель")
+                return
+
+            sheet.update_cell(row_number, 7, "⏳ На утверждении")
+            sheet.update_cell(row_number, 8, message.text)
+            sheet.update_cell(row_number, 11, datetime.now().strftime("%d.%m.%Y %H:%M"))
+
+            _, updated_row = find_task(task_id)
+            await update_card(task_id, updated_row, review_keyboard(task_id))
+
+            await message.answer(f"✅ Задача #{task_id} отправлена на утверждение")
+            await notify_creator(
+                updated_row,
+                f"⏳ {row[2]} сдал задачу #{task_id}\nРезультат: {message.text}",
+                review_keyboard(task_id),
+            )
+
+        elif action == "move":
+            if username != assignee:
+                await message.answer("Перенос может запросить только исполнитель")
+                return
+
+            sheet.update_cell(row_number, 9, message.text)
+            sheet.update_cell(row_number, 11, datetime.now().strftime("%d.%m.%Y %H:%M"))
+
+            await message.answer("⏰ Запрос на перенос отправлен")
+            await notify_creator(
+                row,
+                f"⏰ {row[2]} просит перенести задачу #{task_id}\n\n"
+                f"Новый срок/причина: {message.text}",
+                move_request_keyboard(task_id),
+            )
+
+        elif action == "refuse":
+            if username != assignee:
+                await message.answer("Отказаться может только исполнитель")
+                return
+
+            sheet.update_cell(row_number, 7, "⚠️ Требует переназначения")
+            sheet.update_cell(row_number, 9, message.text)
+            sheet.update_cell(row_number, 11, datetime.now().strftime("%d.%m.%Y %H:%M"))
+
+            _, updated_row = find_task(task_id)
+            await update_card(task_id, updated_row)
+
+            await message.answer("❌ Отказ зафиксирован")
+            await notify_creator(
+                updated_row,
+                f"❌ {row[2]} отказался от задачи #{task_id}\nПричина: {message.text}",
+                reassign_keyboard(task_id),
+            )
+
+        elif action == "rework":
+            if username != creator and not is_admin(username):
+                await message.answer("Правки может отправить только автор или админ")
+                return
+
+            sheet.update_cell(row_number, 7, "✏️ На доработке")
+            sheet.update_cell(row_number, 9, message.text)
+            sheet.update_cell(row_number, 11, datetime.now().strftime("%d.%m.%Y %H:%M"))
+
+            _, updated_row = find_task(task_id)
+            await update_card(task_id, updated_row, work_keyboard(task_id))
+
+            await message.answer(f"✏️ Задача #{task_id} отправлена на доработку")
+
+        elif action == "reassign":
+            if not is_admin(username):
+                await message.answer("Переназначить может только админ")
+                return
+
+            new_assignee = message.text.strip()
+
+            if not new_assignee.startswith("@"):
+                await message.answer("Нужен username в формате @username")
+                return
+
+            sheet.update_cell(row_number, 3, new_assignee)
+            sheet.update_cell(row_number, 7, "❓ Ожидает подтверждения")
+            sheet.update_cell(row_number, 11, datetime.now().strftime("%d.%m.%Y %H:%M"))
+
+            _, updated_row = find_task(task_id)
+            await update_card(task_id, updated_row, waiting_keyboard(task_id))
+
+            await message.answer(f"🔄 Задача #{task_id} переназначена на {new_assignee}")
+
+        user_states.pop(message.from_user.id, None)
+        return
+
+    if is_admin(message.from_user.username) and "@" in message.text:
+        parsed = parse_free_task(message.text)
+
+        if parsed:
+            assignee, description, deadline, link = parsed
+            task_id = await create_task_from_parts(message, assignee, description, deadline, link)
+            await message.answer(f"✅ Создал задачу #{task_id}")
+            return
+
+    await message.answer(
+        "Я не понял сообщение.\n\n"
+        "Используй кнопки меню или напиши задачу с @исполнителем."
+    )
 
 
 async def main():

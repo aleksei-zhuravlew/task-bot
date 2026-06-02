@@ -1,0 +1,10 @@
+
+services:
+  task-bot:
+    build: .
+    container_name: task-bot
+    restart: always
+    env_file:
+      - .env
+    volumes:
+      - ./credentials.json:/app/credentials.json
