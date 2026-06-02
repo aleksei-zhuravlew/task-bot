@@ -770,14 +770,20 @@ async def text_handler(message: Message):
         user_states.pop(message.from_user.id, None)
         return
 
-    if "@" in message.text:
-        parsed = parse_free_task(message.text)
+    if message.text and "@" in message.text and not message.text.startswith("/"):
+    parsed = parse_free_task(message.text)
 
-        if parsed:
-            assignee, description, deadline, link = parsed
-            task_id = await create_task_from_parts(message, assignee, description, deadline, link)
-            await message.answer(f"✅ Создал задачу #{task_id}")
-            return
+    if parsed:
+        assignee, description, deadline, link = parsed
+        task_id = await create_task_from_parts(
+            message,
+            assignee,
+            description,
+            deadline,
+            link
+        )
+        await message.answer(f"✅ Создал задачу #{task_id}")
+        return
 
     await message.answer(
         "Я не понял сообщение.\n\n"
