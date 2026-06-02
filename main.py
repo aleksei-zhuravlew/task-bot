@@ -37,6 +37,7 @@ client = gspread.authorize(creds)
 spreadsheet = client.open(SPREADSHEET_NAME)
 sheet = spreadsheet.worksheet("tasks")
 admins_sheet = spreadsheet.worksheet("admins")
+users_sheet = spreadsheet.worksheet("Users")
 
 
 def norm_user(username):
@@ -52,6 +53,35 @@ def get_admins():
 
 def is_admin(username):
     return norm_user(username) in get_admins()
+
+
+def save_user(message: Message):
+    username = norm_user(message.from_user.username)
+    user_id = str(message.from_user.id)
+
+    if not username:
+        return
+
+    values = users_sheet.get_all_values()
+
+    for i, row in enumerate(values):
+        if row and norm_user(row[0]) == username:
+            users_sheet.update_cell(i + 1, 2, user_id)
+            return
+
+    role = "admin" if is_admin(username) else "user"
+    users_sheet.append_row([username, user_id, role])
+
+
+def get_user_id_by_username(username):
+    username = norm_user(username)
+    values = users_sheet.get_all_values()[1:]
+
+    for row in values:
+        if len(row) >= 2 and norm_user(row[0]) == username:
+            return row[1]
+
+    return None
 
 
 def active_status(status):
@@ -217,11 +247,20 @@ async def update_card(task_id, row, keyboard=None):
 
 async def notify_creator(row, text, keyboard=None):
     creator_username = norm_user(row[1])
-    # Telegram не позволяет писать по username без user_id.
-    # Пока уведомление дублируем в чат карточки.
-    chat_id = row[12]
-    if chat_id:
-        await bot.send_message(chat_id, text, reply_markup=keyboard)
+    creator_user_id = get_user_id_by_username(creator_username)
+
+    if creator_user_id:
+        try:
+            await bot.send_message(
+                int(creator_user_id),
+                text,
+                reply_markup=keyboard,
+            )
+            return
+        except Exception as e:
+            logging.warning(f"Не удалось отправить ЛС @{creator_username}: {e}")
+
+    logging.warning(f"Не найден user_id для @{creator_username}")
 
 
 def parse_free_task(text):
@@ -293,6 +332,12 @@ async def create_task_from_parts(message, assignee, description, deadline, link)
 
 @dp.message(Command("start"))
 async def start(message: Message):
+    save_user(message)
+
+    logging.info(
+        f"START USER: {message.from_user.username} ID: {message.from_user.id}"
+    )
+
     await message.answer(
         "Кабинет открыт ✅",
         reply_markup=main_menu(message.from_user.username),
@@ -663,7 +708,9 @@ async def reassign(callback: CallbackQuery):
 
 @dp.message()
 async def text_handler(message: Message):
-    print("MESSAGE:", message.text)
+    logging.info(
+        f"CHAT={message.chat.id} THREAD={message.message_thread_id} TEXT={message.text}"
+    )
 
     state = user_states.get(message.from_user.id)
 
