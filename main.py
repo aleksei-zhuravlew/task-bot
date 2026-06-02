@@ -663,6 +663,8 @@ async def reassign(callback: CallbackQuery):
 
 @dp.message()
 async def text_handler(message: Message):
+    print("MESSAGE:", message.text)
+
     state = user_states.get(message.from_user.id)
 
     if state:
