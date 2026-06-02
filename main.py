@@ -301,7 +301,7 @@ async def start(message: Message):
 
 @dp.message(Command("задача"))
 async def create_task_command(message: Message):
-    text = message.text.replace("/задача", "").strip()
+    text = re.sub(r"^/задача(@\w+)?", "", message.text).strip()
 
     try:
         parts = text.split("|")
@@ -770,7 +770,7 @@ async def text_handler(message: Message):
         user_states.pop(message.from_user.id, None)
         return
 
-    if is_admin(message.from_user.username) and "@" in message.text:
+    if "@" in message.text:
         parsed = parse_free_task(message.text)
 
         if parsed:
