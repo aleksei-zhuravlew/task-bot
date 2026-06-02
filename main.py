@@ -26,6 +26,9 @@ dp = Dispatcher()
 
 user_states = {}
 
+ALLOWED_CHAT_ID = -1002286714421
+TASKS_THREAD_ID = 40448
+
 scope = [
     "https://spreadsheets.google.com/feeds",
     "https://www.googleapis.com/auth/drive",
@@ -83,6 +86,32 @@ def get_user_id_by_username(username):
 
     return None
 
+
+def is_private_chat(message: Message):
+    return message.chat.type == "private"
+
+
+def is_allowed_message(message: Message):
+    if is_private_chat(message):
+        return True
+
+    if message.chat.id != ALLOWED_CHAT_ID:
+        return False
+
+    return message.message_thread_id == TASKS_THREAD_ID
+
+
+def is_allowed_callback(callback: CallbackQuery):
+    if not callback.message:
+        return True
+
+    if callback.message.chat.type == "private":
+        return True
+
+    if callback.message.chat.id != ALLOWED_CHAT_ID:
+        return False
+
+    return callback.message.message_thread_id == TASKS_THREAD_ID
 
 def active_status(status):
     return status not in ["✅ Готово", "❌ Отменена"]
@@ -332,6 +361,9 @@ async def create_task_from_parts(message, assignee, description, deadline, link)
 
 @dp.message(Command("start"))
 async def start(message: Message):
+    if not is_allowed_message(message):
+        return
+
     save_user(message)
 
     logging.info(
@@ -346,6 +378,9 @@ async def start(message: Message):
 
 @dp.message(Command("задача"))
 async def create_task_command(message: Message):
+    if not is_allowed_message(message):
+        return
+
     text = re.sub(r"^/задача(@\w+)?", "", message.text).strip()
 
     try:
@@ -373,6 +408,9 @@ async def create_task_command(message: Message):
 @dp.message(F.text == "📋 Мои задачи")
 @dp.message(Command("мои"))
 async def my_tasks(message: Message):
+    if not is_allowed_message(message):
+        return
+
     tasks = get_active_tasks_for_user(message.from_user.username)
 
     if not tasks:
@@ -388,6 +426,9 @@ async def my_tasks(message: Message):
 
 @dp.message(F.text == "📌 Все активные")
 async def all_active(message: Message):
+    if not is_allowed_message(message):
+        return
+
     if not is_admin(message.from_user.username):
         return
 
@@ -406,6 +447,9 @@ async def all_active(message: Message):
 
 @dp.message(F.text == "⏳ На утверждении")
 async def review_list(message: Message):
+    if not is_allowed_message(message):
+        return
+
     if not is_admin(message.from_user.username):
         return
 
@@ -421,6 +465,9 @@ async def review_list(message: Message):
 
 @dp.message(F.text == "👥 Переназначение")
 async def reassign_list(message: Message):
+    if not is_allowed_message(message):
+        return
+
     if not is_admin(message.from_user.username):
         return
 
@@ -436,6 +483,9 @@ async def reassign_list(message: Message):
 
 @dp.message(F.text == "📎 Сдать работу")
 async def choose_submit(message: Message):
+    if not is_allowed_message(message):
+        return
+
     tasks = get_active_tasks_for_user(message.from_user.username)
     tasks = [t for t in tasks if t[6] in ["🔄 В работе", "✏️ На доработке"]]
 
@@ -455,6 +505,9 @@ async def choose_submit(message: Message):
 
 @dp.message(F.text == "⏰ Перенести срок")
 async def choose_move(message: Message):
+    if not is_allowed_message(message):
+        return
+
     tasks = get_active_tasks_for_user(message.from_user.username)
 
     if not tasks:
@@ -473,6 +526,9 @@ async def choose_move(message: Message):
 
 @dp.message(F.text == "🆘 Нужна помощь")
 async def choose_help(message: Message):
+    if not is_allowed_message(message):
+        return
+
     tasks = get_active_tasks_for_user(message.from_user.username)
 
     if not tasks:
@@ -491,6 +547,9 @@ async def choose_help(message: Message):
 
 @dp.message(F.text == "❌ Отказаться")
 async def choose_refuse(message: Message):
+    if not is_allowed_message(message):
+        return
+
     tasks = get_active_tasks_for_user(message.from_user.username)
 
     if not tasks:
@@ -509,6 +568,10 @@ async def choose_refuse(message: Message):
 
 @dp.callback_query(lambda c: c.data.startswith("take_"))
 async def take_task(callback: CallbackQuery):
+    if not is_allowed_callback(callback):
+        await callback.answer("Этот бот работает только в разделе ЗАДАЧИ", show_alert=True)
+        return
+
     task_id = callback.data.split("_")[1]
     row_number, row = find_task(task_id)
 
@@ -538,6 +601,10 @@ async def take_task(callback: CallbackQuery):
 
 @dp.callback_query(lambda c: c.data.startswith("submit_"))
 async def submit_task(callback: CallbackQuery):
+    if not is_allowed_callback(callback):
+        await callback.answer("Этот бот работает только в разделе ЗАДАЧИ", show_alert=True)
+        return
+
     task_id = callback.data.split("_")[1]
     user_states[callback.from_user.id] = {"action": "submit", "task_id": task_id}
 
@@ -549,6 +616,10 @@ async def submit_task(callback: CallbackQuery):
 
 @dp.callback_query(lambda c: c.data.startswith("move_"))
 async def move_deadline(callback: CallbackQuery):
+    if not is_allowed_callback(callback):
+        await callback.answer("Этот бот работает только в разделе ЗАДАЧИ", show_alert=True)
+        return
+
     task_id = callback.data.split("_")[1]
     user_states[callback.from_user.id] = {"action": "move", "task_id": task_id}
 
@@ -561,6 +632,10 @@ async def move_deadline(callback: CallbackQuery):
 
 @dp.callback_query(lambda c: c.data.startswith("refuse_") or c.data.startswith("decline_"))
 async def refuse_task(callback: CallbackQuery):
+    if not is_allowed_callback(callback):
+        await callback.answer("Этот бот работает только в разделе ЗАДАЧИ", show_alert=True)
+        return
+
     task_id = callback.data.split("_")[1]
     user_states[callback.from_user.id] = {"action": "refuse", "task_id": task_id}
 
@@ -572,6 +647,10 @@ async def refuse_task(callback: CallbackQuery):
 
 @dp.callback_query(lambda c: c.data.startswith("help_"))
 async def help_task(callback: CallbackQuery):
+    if not is_allowed_callback(callback):
+        await callback.answer("Этот бот работает только в разделе ЗАДАЧИ", show_alert=True)
+        return
+
     task_id = callback.data.split("_")[1]
     row_number, row = find_task(task_id)
 
@@ -594,6 +673,10 @@ async def help_task(callback: CallbackQuery):
 
 @dp.callback_query(lambda c: c.data.startswith("accept_"))
 async def accept_task(callback: CallbackQuery):
+    if not is_allowed_callback(callback):
+        await callback.answer("Этот бот работает только в разделе ЗАДАЧИ", show_alert=True)
+        return
+
     task_id = callback.data.split("_")[1]
     row_number, row = find_task(task_id)
 
@@ -620,6 +703,10 @@ async def accept_task(callback: CallbackQuery):
 
 @dp.callback_query(lambda c: c.data.startswith("rework_"))
 async def rework_task(callback: CallbackQuery):
+    if not is_allowed_callback(callback):
+        await callback.answer("Этот бот работает только в разделе ЗАДАЧИ", show_alert=True)
+        return
+
     task_id = callback.data.split("_")[1]
     user_states[callback.from_user.id] = {"action": "rework", "task_id": task_id}
 
@@ -631,6 +718,10 @@ async def rework_task(callback: CallbackQuery):
 
 @dp.callback_query(lambda c: c.data.startswith("cancel_"))
 async def cancel_task(callback: CallbackQuery):
+    if not is_allowed_callback(callback):
+        await callback.answer("Этот бот работает только в разделе ЗАДАЧИ", show_alert=True)
+        return
+
     task_id = callback.data.split("_")[1]
     row_number, row = find_task(task_id)
 
@@ -657,6 +748,10 @@ async def cancel_task(callback: CallbackQuery):
 
 @dp.callback_query(lambda c: c.data.startswith("approve_move_"))
 async def approve_move(callback: CallbackQuery):
+    if not is_allowed_callback(callback):
+        await callback.answer("Этот бот работает только в разделе ЗАДАЧИ", show_alert=True)
+        return
+
     task_id = callback.data.split("_")[2]
     row_number, row = find_task(task_id)
 
@@ -685,6 +780,10 @@ async def approve_move(callback: CallbackQuery):
 
 @dp.callback_query(lambda c: c.data.startswith("deny_move_"))
 async def deny_move(callback: CallbackQuery):
+    if not is_allowed_callback(callback):
+        await callback.answer("Этот бот работает только в разделе ЗАДАЧИ", show_alert=True)
+        return
+
     task_id = callback.data.split("_")[2]
 
     if not is_admin(callback.from_user.username):
@@ -697,6 +796,10 @@ async def deny_move(callback: CallbackQuery):
 
 @dp.callback_query(lambda c: c.data.startswith("reassign_"))
 async def reassign(callback: CallbackQuery):
+    if not is_allowed_callback(callback):
+        await callback.answer("Этот бот работает только в разделе ЗАДАЧИ", show_alert=True)
+        return
+
     task_id = callback.data.split("_")[1]
     user_states[callback.from_user.id] = {"action": "reassign", "task_id": task_id}
 
@@ -708,9 +811,10 @@ async def reassign(callback: CallbackQuery):
 
 @dp.message()
 async def text_handler(message: Message):
-    logging.info(
-        f"CHAT={message.chat.id} THREAD={message.message_thread_id} TEXT={message.text}"
-    )
+    logging.info(f"CHAT={message.chat.id} THREAD={message.message_thread_id} TEXT={message.text}")
+
+    if not is_allowed_message(message):
+        return
 
     state = user_states.get(message.from_user.id)
 
