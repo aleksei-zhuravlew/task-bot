@@ -356,6 +356,7 @@ async def create_task_from_parts(message, assignee, description, deadline, link)
     sheet.update_cell(row_number, 13, sent.chat.id)
     sheet.update_cell(row_number, 14, sent.message_id)
 
+    logging.info(f"ASSIGNEE={assignee} FOUND_USER_ID={get_user_id_by_username(assignee)}")
     assignee_user_id = get_user_id_by_username(assignee)
 
     if assignee_user_id:
