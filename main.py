@@ -356,6 +356,26 @@ async def create_task_from_parts(message, assignee, description, deadline, link)
     sheet.update_cell(row_number, 13, sent.chat.id)
     sheet.update_cell(row_number, 14, sent.message_id)
 
+    assignee_user_id = get_user_id_by_username(assignee)
+
+    if assignee_user_id:
+        try:
+            await bot.send_message(
+                int(assignee_user_id),
+                f"📋 Тебе поставили задачу #{task_id}\n\n"
+                f"Описание: {description}\n"
+                f"Дедлайн: {deadline}\n"
+                f"Материал: {link if link else 'не указан'}",
+                reply_markup=waiting_keyboard(task_id),
+            )
+        except Exception as e:
+            logging.warning(f"Не удалось отправить задачу исполнителю {assignee}: {e}")
+    else:
+        logging.warning(
+            f"Не найден user_id для исполнителя {assignee}. "
+            "Исполнитель должен написать боту /start в личке."
+        )
+
     return task_id
 
 
