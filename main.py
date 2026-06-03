@@ -255,6 +255,8 @@ def make_task_text(task_id, row):
     if row[8]:
         text += f"\nКомментарий: {row[8]}"
 
+    text += "\n\n🤖 Управление задачей: @glavzadacha_bot"
+
     return text
 
 
@@ -349,7 +351,7 @@ async def create_task_from_parts(message, assignee, description, deadline, link)
 
     sent = await message.answer(
         make_task_text(task_id, [str(x) for x in row]),
-        reply_markup=waiting_keyboard(task_id),
+        reply_markup=None,
     )
 
     row_number, saved_row = find_task(task_id)
@@ -794,7 +796,7 @@ async def approve_move(callback: CallbackQuery):
     sheet.update_cell(row_number, 11, datetime.now().strftime("%d.%m.%Y %H:%M"))
 
     _, updated_row = find_task(task_id)
-    await update_card(task_id, updated_row, work_keyboard(task_id))
+    await update_card(task_id, updated_row, None)
 
     await callback.message.answer(f"✅ Перенос задачи #{task_id} одобрен. Новый срок: {new_deadline}")
     await callback.answer("Одобрено")
@@ -864,7 +866,7 @@ async def text_handler(message: Message):
             sheet.update_cell(row_number, 11, datetime.now().strftime("%d.%m.%Y %H:%M"))
 
             _, updated_row = find_task(task_id)
-            await update_card(task_id, updated_row, review_keyboard(task_id))
+            await update_card(task_id, updated_row, None)
 
             await message.answer(f"✅ Задача #{task_id} отправлена на утверждение")
             await notify_creator(
@@ -918,7 +920,7 @@ async def text_handler(message: Message):
             sheet.update_cell(row_number, 11, datetime.now().strftime("%d.%m.%Y %H:%M"))
 
             _, updated_row = find_task(task_id)
-            await update_card(task_id, updated_row, work_keyboard(task_id))
+            await update_card(task_id, updated_row, None)
 
             await message.answer(f"✏️ Задача #{task_id} отправлена на доработку")
 
@@ -938,7 +940,7 @@ async def text_handler(message: Message):
             sheet.update_cell(row_number, 11, datetime.now().strftime("%d.%m.%Y %H:%M"))
 
             _, updated_row = find_task(task_id)
-            await update_card(task_id, updated_row, waiting_keyboard(task_id))
+            await update_card(task_id, updated_row, None)
 
             await message.answer(f"🔄 Задача #{task_id} переназначена на {new_assignee}")
 
