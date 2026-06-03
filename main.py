@@ -364,6 +364,7 @@ async def create_task_from_parts(message, assignee, description, deadline, link)
             await bot.send_message(
                 int(assignee_user_id),
                 f"📋 Тебе поставили задачу #{task_id}\n\n"
+                f"Поставил: @{norm_user(message.from_user.username)}\n"
                 f"Описание: {description}\n"
                 f"Дедлайн: {deadline}\n"
                 f"Материал: {link if link else 'не указан'}",
