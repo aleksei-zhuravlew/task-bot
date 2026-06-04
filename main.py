@@ -245,6 +245,27 @@ def reassign_keyboard(task_id):
     ]])
 
 
+def admin_help_keyboard(task_id, assignee):
+    assignee_username = norm_user(assignee)
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🤝 Помочь",
+                    callback_data=f"admin_help_{task_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="💬 Связаться в чате",
+                    url=f"https://t.me/{assignee_username}",
+                )
+            ],
+        ]
+    )
+
+
 def make_task_text(task_id, row):
     text = (
         f"📋 ЗАДАЧА #{task_id}\n\n"
@@ -942,17 +963,23 @@ async def help_task(callback: CallbackQuery):
         await callback.answer("Задача не найдена", show_alert=True)
         return
 
+    username = norm_user(callback.from_user.username)
+    assignee = norm_user(row[2])
+
+    if username != assignee:
+        await callback.answer("Запросить помощь может только исполнитель", show_alert=True)
+        return
+
+    user_states[callback.from_user.id] = {
+        "action": "help_request",
+        "task_id": task_id,
+    }
+
     await callback.message.answer(
-        f"🆘 Задаче #{task_id} {row[2]} нужна помощь.\n"
-        f"Описание: {row[3]}"
+        f"🆘 Напиши, что именно нужно по задаче #{task_id}.\n\n"
+        f"Например: не хватает исходников, нужна редактура, нужен контакт героя."
     )
-
-    await notify_creator(
-        row,
-        f"🆘 {row[2]} просит помощь по задаче #{task_id}\n\n{row[3]}"
-    )
-
-    await callback.answer("Запрос отправлен")
+    await callback.answer()
 
 
 @dp.callback_query(lambda c: c.data.startswith("accept_"))
@@ -983,6 +1010,38 @@ async def accept_task(callback: CallbackQuery):
     await callback.message.edit_text(make_task_text(task_id, updated_row))
     await callback.message.answer(f"✅ Задача #{task_id} выполнена")
     await callback.answer("Принято ✅")
+
+
+@dp.callback_query(lambda c: c.data.startswith("admin_help_"))
+async def admin_help(callback: CallbackQuery):
+    if not is_allowed_callback(callback):
+        await callback.answer("Этот бот работает только в разделе ЗАДАЧИ", show_alert=True)
+        return
+
+    task_id = callback.data.split("_")[2]
+    row_number, row = find_task(task_id)
+
+    if not row:
+        await callback.answer("Задача не найдена", show_alert=True)
+        return
+
+    username = norm_user(callback.from_user.username)
+    creator = norm_user(row[1])
+
+    if username != creator and not is_admin(username):
+        await callback.answer("Помочь может автор задачи или админ", show_alert=True)
+        return
+
+    user_states[callback.from_user.id] = {
+        "action": "admin_help_reply",
+        "task_id": task_id,
+    }
+
+    await callback.message.answer(
+        f"Напиши комментарий помощи по задаче #{task_id}.\\n\\n"
+        f"Я отправлю его исполнителю {row[2]}."
+    )
+    await callback.answer()
 
 
 @dp.callback_query(lambda c: c.data.startswith("rework_"))
@@ -1170,6 +1229,58 @@ async def text_handler(message: Message):
                 f"❌ {row[2]} отказался от задачи #{task_id}\nПричина: {message.text}",
                 reassign_keyboard(task_id),
             )
+
+        elif action == "help_request":
+            if username != assignee:
+                await message.answer("Запросить помощь может только исполнитель")
+                return
+
+            help_text = message.text.strip()
+
+            old_comment = row[8] if row[8] else ""
+            new_comment = f"{old_comment}\\n🆘 Запрос помощи: {help_text}".strip()
+
+            sheet.update_cell(row_number, 9, new_comment)
+            sheet.update_cell(row_number, 11, datetime.now().strftime("%d.%m.%Y %H:%M"))
+
+            _, updated_row = find_task(task_id)
+            await update_card(task_id, updated_row, None)
+
+            await message.answer("🆘 Запрос помощи отправлен автору задачи.")
+
+            await notify_creator(
+                updated_row,
+                f"🆘 Запрос помощи по задаче #{task_id}\\n\\n"
+                f"Исполнитель: {row[2]}\\n"
+                f"Описание: {row[3]}\\n\\n"
+                f"Что нужно:\\n{help_text}",
+                admin_help_keyboard(task_id, row[2]),
+            )
+
+        elif action == "admin_help_reply":
+            if username != creator and not is_admin(username):
+                await message.answer("Ответить на запрос помощи может только автор или админ")
+                return
+
+            reply_text = message.text.strip()
+
+            old_comment = row[8] if row[8] else ""
+            new_comment = f"{old_comment}\\n🤝 Ответ помощи от @{username}: {reply_text}".strip()
+
+            sheet.update_cell(row_number, 9, new_comment)
+            sheet.update_cell(row_number, 11, datetime.now().strftime("%d.%m.%Y %H:%M"))
+
+            _, updated_row = find_task(task_id)
+            await update_card(task_id, updated_row, None)
+
+            await notify_user_by_username(
+                row[2],
+                f"🤝 Ответ по задаче #{task_id}\\n\\n"
+                f"От: @{username}\\n"
+                f"Комментарий:\\n{reply_text}",
+            )
+
+            await message.answer(f"🤝 Комментарий отправлен исполнителю {row[2]}.")
 
         elif action == "rework":
             if username != creator and not is_admin(username):
