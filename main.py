@@ -28,6 +28,7 @@ user_states = {}
 
 ALLOWED_CHAT_ID = -1002286714421
 TASKS_THREAD_ID = 40448
+COMPLETED_THREAD_ID = 43115
 
 REMINDER_36_COL = 15
 REMINDER_12_COL = 16
@@ -1009,6 +1010,26 @@ async def accept_task(callback: CallbackQuery):
 
     await callback.message.edit_text(make_task_text(task_id, updated_row))
     await callback.message.answer(f"✅ Задача #{task_id} выполнена")
+
+    try:
+        await bot.send_message(
+            chat_id=ALLOWED_CHAT_ID,
+            message_thread_id=COMPLETED_THREAD_ID,
+            text=(
+                f"✅ ВЫПОЛНЕННАЯ ЗАДАЧА\n\n"
+                f"📋 #{task_id}\n\n"
+                f"👤 Автор: @{updated_row[1]}\n"
+                f"🧑‍💻 Исполнитель: {updated_row[2]}\n\n"
+                f"📝 Описание:\n{updated_row[3]}\n\n"
+                f"🔗 Результат:\n"
+                f"{updated_row[7] if updated_row[7] else 'не указан'}\n\n"
+                f"✅ Принял: @{username}\n"
+                f"🕒 {datetime.now().strftime('%d.%m.%Y %H:%M')}"
+            ),
+        )
+    except Exception as e:
+        logging.warning(f"Ошибка отправки в раздел выполненных задач: {e}")
+
     await callback.answer("Принято ✅")
 
 
@@ -1038,7 +1059,7 @@ async def admin_help(callback: CallbackQuery):
     }
 
     await callback.message.answer(
-        f"Напиши комментарий помощи по задаче #{task_id}.\\n\\n"
+        f"Напиши комментарий помощи по задаче #{task_id}.\n\n"
         f"Я отправлю его исполнителю {row[2]}."
     )
     await callback.answer()
@@ -1238,7 +1259,7 @@ async def text_handler(message: Message):
             help_text = message.text.strip()
 
             old_comment = row[8] if row[8] else ""
-            new_comment = f"{old_comment}\\n🆘 Запрос помощи: {help_text}".strip()
+            new_comment = f"{old_comment}\n🆘 Запрос помощи: {help_text}".strip()
 
             sheet.update_cell(row_number, 9, new_comment)
             sheet.update_cell(row_number, 11, datetime.now().strftime("%d.%m.%Y %H:%M"))
@@ -1250,10 +1271,11 @@ async def text_handler(message: Message):
 
             await notify_creator(
                 updated_row,
-                f"🆘 Запрос помощи по задаче #{task_id}\\n\\n"
-                f"Исполнитель: {row[2]}\\n"
-                f"Описание: {row[3]}\\n\\n"
-                f"Что нужно:\\n{help_text}",
+                f"🆘 ЗАПРОС ПОМОЩИ\n\n"
+                f"📋 Задача #{task_id}\n\n"
+                f"👤 Исполнитель: {row[2]}\n"
+                f"📝 Описание:\n{row[3]}\n\n"
+                f"❓ Что нужно:\n{help_text}",
                 admin_help_keyboard(task_id, row[2]),
             )
 
@@ -1265,7 +1287,7 @@ async def text_handler(message: Message):
             reply_text = message.text.strip()
 
             old_comment = row[8] if row[8] else ""
-            new_comment = f"{old_comment}\\n🤝 Ответ помощи от @{username}: {reply_text}".strip()
+            new_comment = f"{old_comment}\n🤝 Ответ помощи от @{username}: {reply_text}".strip()
 
             sheet.update_cell(row_number, 9, new_comment)
             sheet.update_cell(row_number, 11, datetime.now().strftime("%d.%m.%Y %H:%M"))
@@ -1275,9 +1297,10 @@ async def text_handler(message: Message):
 
             await notify_user_by_username(
                 row[2],
-                f"🤝 Ответ по задаче #{task_id}\\n\\n"
-                f"От: @{username}\\n"
-                f"Комментарий:\\n{reply_text}",
+                f"🤝 ПОМОЩЬ ПО ЗАДАЧЕ\n\n"
+                f"📋 Задача #{task_id}\n\n"
+                f"👤 От: @{username}\n\n"
+                f"💬 Комментарий:\n{reply_text}",
             )
 
             await message.answer(f"🤝 Комментарий отправлен исполнителю {row[2]}.")
