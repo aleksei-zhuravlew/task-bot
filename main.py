@@ -498,9 +498,16 @@ async def my_tasks(message: Message):
         return
 
     for row in tasks:
+        if row[6] == "❓ Ожидает подтверждения":
+            keyboard = waiting_keyboard(row[0])
+        elif row[6] in ["🔄 В работе", "✏️ На доработке"]:
+            keyboard = task_action_keyboard(row[0])
+        else:
+            keyboard = None
+
         await message.answer(
             make_task_text(row[0], row),
-            reply_markup=task_action_keyboard(row[0]),
+            reply_markup=keyboard,
         )
 
 
