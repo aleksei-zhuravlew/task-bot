@@ -580,18 +580,25 @@ async def completed_tasks_summary(message: Message):
             completed.append(row)
 
     if not completed:
-        await message.answer("Выполненных задач пока нет")
+        await message.answer("✅ ВЫПОЛНЕННЫЕ ЗАДАЧИ\n\nПока нет выполненных задач.")
         return
 
-    text = "✅ Выполненные задачи:\\n\\n"
+    text = "✅ ВЫПОЛНЕННЫЕ ЗАДАЧИ\n\n"
 
     for row in completed[-20:]:
-        result = row[7] if row[7] else "результат не указан"
+        result = row[7] if row[7] else "не указан"
+        finished_at = row[10] if row[10] else "не указано"
+
         text += (
-            f"#{row[0]} — {row[2]}\\n"
-            f"{row[3]}\\n"
-            f"Результат: {result}\\n\\n"
+            f"#{row[0]} — {row[3]}\n\n"
+            f"👤 Автор: @{norm_user(row[1])}\n"
+            f"🧑‍💻 Исполнитель: {row[2]}\n"
+            f"🔗 Результат: {result}\n"
+            f"🕒 Выполнено: {finished_at}\n"
+            f"──────────────\n\n"
         )
+
+    text += f"📋 Показано: {min(len(completed), 20)} из {len(completed)}"
 
     await message.answer(text)
 
@@ -636,21 +643,24 @@ async def tasks_stats(message: Message):
         if status == "✏️ На доработке":
             rework += 1
 
+    updated_at = datetime.now().strftime("%d.%m.%Y %H:%M")
+
     text = (
-        "📊 Статистика задач:\\n\\n"
-        f"Всего выдано: {total}\\n"
-        f"Выполнено: {done}\\n"
-        f"Просрочено: {overdue}\\n"
-        f"Перенесено: {moved}\\n"
-        f"Ожидают подтверждения: {waiting}\\n"
-        f"Отказ / переназначение: {refused}\\n\\n"
-        f"В работе: {in_progress}\\n"
-        f"На утверждении: {review}\\n"
-        f"На доработке: {rework}"
+        "📊 СТАТИСТИКА ЗАДАЧ\n\n"
+        "Общая статистика по всем задачам\n\n"
+        f"📄 Всего выдано: {total}\n"
+        f"✅ Выполнено: {done}\n"
+        f"🔴 Просрочено: {overdue}\n"
+        f"🔄 Перенесено: {moved}\n"
+        f"⏳ Ожидают подтверждения: {waiting}\n"
+        f"❌ Отказано / переназначено: {refused}\n"
+        f"🛠 На доработке: {rework}\n"
+        f"🟡 В работе: {in_progress}\n"
+        f"⌛ На утверждении: {review}\n\n"
+        f"🗓 Данные обновлены: {updated_at}"
     )
 
     await message.answer(text)
-
 
 @dp.message(F.text == "👤 Статистика по людям")
 async def user_tasks_stats(message: Message):
@@ -670,10 +680,7 @@ async def user_tasks_stats(message: Message):
         if not row[0]:
             continue
 
-        username = norm_user(row[2])
-
-        if not username:
-            username = "без_исполнителя"
+        username = norm_user(row[2]) or "без_исполнителя"
 
         if username not in stats:
             stats[username] = {
@@ -695,30 +702,23 @@ async def user_tasks_stats(message: Message):
 
         if status == "✅ Готово":
             stats[username]["done"] += 1
-
         if status == "🔴 Просрочена" or row[11].lower() == "да":
             stats[username]["overdue"] += 1
-
         if "перенос" in comment or "перенести" in comment or "срок" in comment:
             stats[username]["moved"] += 1
-
         if status == "⚠️ Требует переназначения":
             stats[username]["refused"] += 1
-
         if status == "❓ Ожидает подтверждения":
             stats[username]["waiting"] += 1
-
         if status == "🔄 В работе":
             stats[username]["in_progress"] += 1
-
         if status == "⏳ На утверждении":
             stats[username]["review"] += 1
-
         if status == "✏️ На доработке":
             stats[username]["rework"] += 1
 
     if not stats:
-        await message.answer("Статистики пока нет")
+        await message.answer("👤 СТАТИСТИКА ПО ЛЮДЯМ\n\nСтатистики пока нет.")
         return
 
     sorted_users = sorted(
@@ -728,20 +728,21 @@ async def user_tasks_stats(message: Message):
     )
 
     chunks = []
-    current = "👤 Статистика по исполнителям:\n\n"
+    current = "👤 СТАТИСТИКА ПО ЛЮДЯМ\n\nСтатистика по исполнителям\n\n"
 
     for username, data in sorted_users:
         block = (
-            f"@{username}\n"
-            f"Всего: {data['total']}\n"
+            f"👤 @{username}\n\n"
+            f"📄 Всего задач: {data['total']}\n"
             f"✅ Выполнено: {data['done']}\n"
             f"🔴 Просрочено: {data['overdue']}\n"
-            f"⏰ Перенесено: {data['moved']}\n"
-            f"❌ Отказано/переназначено: {data['refused']}\n"
-            f"❓ Ожидают: {data['waiting']}\n"
-            f"🔄 В работе: {data['in_progress']}\n"
-            f"⏳ На утверждении: {data['review']}\n"
-            f"✏️ На доработке: {data['rework']}\n\n"
+            f"🔄 Перенесено: {data['moved']}\n"
+            f"❌ Отказано: {data['refused']}\n"
+            f"⏳ Ожидают: {data['waiting']}\n"
+            f"🛠 На доработке: {data['rework']}\n"
+            f"🟡 В работе: {data['in_progress']}\n"
+            f"⌛ На утверждении: {data['review']}\n"
+            f"──────────────\n\n"
         )
 
         if len(current) + len(block) > 3500:
@@ -751,11 +752,11 @@ async def user_tasks_stats(message: Message):
         current += block
 
     if current:
+        current += f"📋 Показано исполнителей: {len(sorted_users)}"
         chunks.append(current)
 
     for chunk in chunks:
         await message.answer(chunk)
-
 
 @dp.message(F.text == "📎 Сдать работу")
 async def choose_submit(message: Message):
