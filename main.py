@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
@@ -28,6 +28,11 @@ user_states = {}
 
 ALLOWED_CHAT_ID = -1002286714421
 TASKS_THREAD_ID = 40448
+
+REMINDER_36_COL = 15
+REMINDER_12_COL = 16
+REMINDER_1H_COL = 17
+OVERDUE_NOTICE_COL = 18
 
 scope = [
     "https://spreadsheets.google.com/feeds",
@@ -121,7 +126,7 @@ def find_task(task_id):
     values = sheet.get_all_values()
     for index, row in enumerate(values):
         if row and row[0] == str(task_id):
-            while len(row) < 14:
+            while len(row) < 18:
                 row.append("")
             return index + 1, row
     return None, None
@@ -132,7 +137,7 @@ def get_active_tasks_for_user(username):
     result = []
 
     for row in sheet.get_all_values()[1:]:
-        while len(row) < 14:
+        while len(row) < 18:
             row.append("")
 
         if norm_user(row[2]) == username and active_status(row[6]):
@@ -145,7 +150,7 @@ def get_active_tasks():
     result = []
 
     for row in sheet.get_all_values()[1:]:
-        while len(row) < 14:
+        while len(row) < 18:
             row.append("")
 
         if active_status(row[6]):
@@ -167,6 +172,8 @@ def main_menu(username):
         return ReplyKeyboardMarkup(
             keyboard=[
                 [KeyboardButton(text="📌 Все активные"), KeyboardButton(text="⏳ На утверждении")],
+                [KeyboardButton(text="✅ Выполненные"), KeyboardButton(text="📊 Статистика")],
+                [KeyboardButton(text="👤 Статистика по людям")],
                 [KeyboardButton(text="👥 Переназначение"), KeyboardButton(text="📋 Мои задачи")],
             ],
             resize_keyboard=True,
@@ -327,6 +334,51 @@ def parse_free_task(text):
     return assignee, description, deadline, link
 
 
+def parse_deadline_to_datetime(deadline_text):
+    if not deadline_text:
+        return None
+
+    text = str(deadline_text).strip().lower()
+    now = datetime.now()
+
+    if text in ["не указан", "-", ""]:
+        return None
+
+    if "сегодня" in text:
+        return datetime.combine(now.date(), time(23, 59))
+
+    if "завтра" in text:
+        return datetime.combine((now + timedelta(days=1)).date(), time(23, 59))
+
+    match = re.search(r"\b(\d{1,2})\.(\d{1,2})(?:\.(\d{4}))?\b", text)
+    if not match:
+        return None
+
+    day = int(match.group(1))
+    month = int(match.group(2))
+    year = int(match.group(3)) if match.group(3) else now.year
+
+    try:
+        return datetime(year, month, day, 23, 59)
+    except ValueError:
+        return None
+
+
+async def notify_user_by_username(username, text, keyboard=None):
+    user_id = get_user_id_by_username(username)
+
+    if not user_id:
+        logging.warning(f"Не найден user_id для @{norm_user(username)}")
+        return False
+
+    try:
+        await bot.send_message(int(user_id), text, reply_markup=keyboard)
+        return True
+    except Exception as e:
+        logging.warning(f"Не удалось отправить ЛС @{norm_user(username)}: {e}")
+        return False
+
+
 async def create_task_from_parts(message, assignee, description, deadline, link):
     task_id = len(sheet.get_all_values())
 
@@ -343,6 +395,10 @@ async def create_task_from_parts(message, assignee, description, deadline, link)
         datetime.now().strftime("%d.%m.%Y %H:%M"),
         datetime.now().strftime("%d.%m.%Y %H:%M"),
         "нет",
+        "",
+        "",
+        "",
+        "",
         "",
         "",
     ]
@@ -503,6 +559,202 @@ async def reassign_list(message: Message):
 
     for row in tasks:
         await message.answer(make_task_text(row[0], row), reply_markup=reassign_keyboard(row[0]))
+
+
+@dp.message(F.text == "✅ Выполненные")
+async def completed_tasks_summary(message: Message):
+    if not is_allowed_message(message):
+        return
+
+    if not is_admin(message.from_user.username):
+        return
+
+    rows = sheet.get_all_values()[1:]
+    completed = []
+
+    for row in rows:
+        while len(row) < 18:
+            row.append("")
+
+        if row[6] == "✅ Готово":
+            completed.append(row)
+
+    if not completed:
+        await message.answer("Выполненных задач пока нет")
+        return
+
+    text = "✅ Выполненные задачи:\\n\\n"
+
+    for row in completed[-20:]:
+        result = row[7] if row[7] else "результат не указан"
+        text += (
+            f"#{row[0]} — {row[2]}\\n"
+            f"{row[3]}\\n"
+            f"Результат: {result}\\n\\n"
+        )
+
+    await message.answer(text)
+
+
+@dp.message(F.text == "📊 Статистика")
+async def tasks_stats(message: Message):
+    if not is_allowed_message(message):
+        return
+
+    if not is_admin(message.from_user.username):
+        return
+
+    rows = sheet.get_all_values()[1:]
+
+    total = done = overdue = moved = waiting = refused = in_progress = review = rework = 0
+
+    for row in rows:
+        while len(row) < 18:
+            row.append("")
+
+        if not row[0]:
+            continue
+
+        total += 1
+        status = row[6]
+        comment = row[8].lower() if row[8] else ""
+
+        if status == "✅ Готово":
+            done += 1
+        if status == "🔴 Просрочена" or row[11].lower() == "да":
+            overdue += 1
+        if "перенос" in comment or "перенести" in comment or "срок" in comment:
+            moved += 1
+        if status == "❓ Ожидает подтверждения":
+            waiting += 1
+        if status == "⚠️ Требует переназначения":
+            refused += 1
+        if status == "🔄 В работе":
+            in_progress += 1
+        if status == "⏳ На утверждении":
+            review += 1
+        if status == "✏️ На доработке":
+            rework += 1
+
+    text = (
+        "📊 Статистика задач:\\n\\n"
+        f"Всего выдано: {total}\\n"
+        f"Выполнено: {done}\\n"
+        f"Просрочено: {overdue}\\n"
+        f"Перенесено: {moved}\\n"
+        f"Ожидают подтверждения: {waiting}\\n"
+        f"Отказ / переназначение: {refused}\\n\\n"
+        f"В работе: {in_progress}\\n"
+        f"На утверждении: {review}\\n"
+        f"На доработке: {rework}"
+    )
+
+    await message.answer(text)
+
+
+@dp.message(F.text == "👤 Статистика по людям")
+async def user_tasks_stats(message: Message):
+    if not is_allowed_message(message):
+        return
+
+    if not is_admin(message.from_user.username):
+        return
+
+    rows = sheet.get_all_values()[1:]
+    stats = {}
+
+    for row in rows:
+        while len(row) < 18:
+            row.append("")
+
+        if not row[0]:
+            continue
+
+        username = norm_user(row[2])
+
+        if not username:
+            username = "без_исполнителя"
+
+        if username not in stats:
+            stats[username] = {
+                "total": 0,
+                "done": 0,
+                "overdue": 0,
+                "moved": 0,
+                "refused": 0,
+                "waiting": 0,
+                "in_progress": 0,
+                "review": 0,
+                "rework": 0,
+            }
+
+        status = row[6]
+        comment = row[8].lower() if row[8] else ""
+
+        stats[username]["total"] += 1
+
+        if status == "✅ Готово":
+            stats[username]["done"] += 1
+
+        if status == "🔴 Просрочена" or row[11].lower() == "да":
+            stats[username]["overdue"] += 1
+
+        if "перенос" in comment or "перенести" in comment or "срок" in comment:
+            stats[username]["moved"] += 1
+
+        if status == "⚠️ Требует переназначения":
+            stats[username]["refused"] += 1
+
+        if status == "❓ Ожидает подтверждения":
+            stats[username]["waiting"] += 1
+
+        if status == "🔄 В работе":
+            stats[username]["in_progress"] += 1
+
+        if status == "⏳ На утверждении":
+            stats[username]["review"] += 1
+
+        if status == "✏️ На доработке":
+            stats[username]["rework"] += 1
+
+    if not stats:
+        await message.answer("Статистики пока нет")
+        return
+
+    sorted_users = sorted(
+        stats.items(),
+        key=lambda item: item[1]["total"],
+        reverse=True,
+    )
+
+    chunks = []
+    current = "👤 Статистика по исполнителям:\n\n"
+
+    for username, data in sorted_users:
+        block = (
+            f"@{username}\n"
+            f"Всего: {data['total']}\n"
+            f"✅ Выполнено: {data['done']}\n"
+            f"🔴 Просрочено: {data['overdue']}\n"
+            f"⏰ Перенесено: {data['moved']}\n"
+            f"❌ Отказано/переназначено: {data['refused']}\n"
+            f"❓ Ожидают: {data['waiting']}\n"
+            f"🔄 В работе: {data['in_progress']}\n"
+            f"⏳ На утверждении: {data['review']}\n"
+            f"✏️ На доработке: {data['rework']}\n\n"
+        )
+
+        if len(current) + len(block) > 3500:
+            chunks.append(current)
+            current = ""
+
+        current += block
+
+    if current:
+        chunks.append(current)
+
+    for chunk in chunks:
+        await message.answer(chunk)
 
 
 @dp.message(F.text == "📎 Сдать работу")
@@ -793,6 +1045,7 @@ async def approve_move(callback: CallbackQuery):
     new_deadline = date_match.group(0)
 
     sheet.update_cell(row_number, 5, new_deadline)
+    sheet.update_cell(row_number, 9, f"Перенос одобрен. Новый срок: {new_deadline}. {comment}")
     sheet.update_cell(row_number, 11, datetime.now().strftime("%d.%m.%Y %H:%M"))
 
     _, updated_row = find_task(task_id)
@@ -968,7 +1221,102 @@ async def text_handler(message: Message):
     )
 
 
+async def deadline_checker():
+    await asyncio.sleep(10)
+
+    while True:
+        try:
+            rows = sheet.get_all_values()
+
+            for index, row in enumerate(rows[1:], start=2):
+                while len(row) < 18:
+                    row.append("")
+
+                task_id = row[0]
+                status = row[6]
+
+                if not task_id or status in ["✅ Готово", "❌ Отменена"]:
+                    continue
+
+                deadline_dt = parse_deadline_to_datetime(row[4])
+
+                if not deadline_dt:
+                    continue
+
+                now = datetime.now()
+                seconds_left = (deadline_dt - now).total_seconds()
+
+                reminder_36_sent = row[14]
+                reminder_12_sent = row[15]
+                reminder_1h_sent = row[16]
+                overdue_notice_sent = row[17]
+
+                if 0 < seconds_left <= 36 * 60 * 60 and reminder_36_sent != "да":
+                    await notify_user_by_username(
+                        row[2],
+                        f"⏰ Напоминание: дедлайн задачи #{task_id} через 36 часов или меньше.\n\n"
+                        f"Описание: {row[3]}\n"
+                        f"Дедлайн: {row[4]}",
+                    )
+                    sheet.update_cell(index, REMINDER_36_COL, "да")
+
+                if 0 < seconds_left <= 12 * 60 * 60 and reminder_12_sent != "да":
+                    await notify_user_by_username(
+                        row[2],
+                        f"⏰ Напоминание: дедлайн задачи #{task_id} через 12 часов или меньше.\n\n"
+                        f"Описание: {row[3]}\n"
+                        f"Дедлайн: {row[4]}",
+                    )
+                    sheet.update_cell(index, REMINDER_12_COL, "да")
+
+                if 0 < seconds_left <= 60 * 60 and reminder_1h_sent != "да":
+                    await notify_user_by_username(
+                        row[2],
+                        f"⚠️ Дедлайн задачи #{task_id} через час или меньше!\n\n"
+                        f"Описание: {row[3]}\n"
+                        f"Дедлайн: {row[4]}",
+                    )
+                    await notify_creator(
+                        row,
+                        f"⚠️ У задачи #{task_id} дедлайн через час или меньше.\n\n"
+                        f"Исполнитель: {row[2]}\n"
+                        f"Описание: {row[3]}\n"
+                        f"Дедлайн: {row[4]}",
+                    )
+                    sheet.update_cell(index, REMINDER_1H_COL, "да")
+
+                if seconds_left <= 0 and overdue_notice_sent != "да":
+                    sheet.update_cell(index, 7, "🔴 Просрочена")
+                    sheet.update_cell(index, 12, "да")
+                    sheet.update_cell(index, OVERDUE_NOTICE_COL, "да")
+                    sheet.update_cell(index, 11, datetime.now().strftime("%d.%m.%Y %H:%M"))
+
+                    _, updated_row = find_task(task_id)
+                    if updated_row:
+                        await update_card(task_id, updated_row, None)
+
+                    await notify_user_by_username(
+                        row[2],
+                        f"🔴 Задача #{task_id} просрочена.\n\n"
+                        f"Описание: {row[3]}\n"
+                        f"Дедлайн: {row[4]}",
+                    )
+                    await notify_creator(
+                        row,
+                        f"🔴 Задача #{task_id} просрочена.\n\n"
+                        f"Исполнитель: {row[2]}\n"
+                        f"Описание: {row[3]}\n"
+                        f"Дедлайн: {row[4]}",
+                    )
+
+        except Exception as e:
+            logging.exception(f"Ошибка проверки дедлайнов: {e}")
+
+        await asyncio.sleep(15 * 60)
+
+
 async def main():
+    asyncio.create_task(deadline_checker())
     await dp.start_polling(bot)
 
 
