@@ -323,6 +323,106 @@ async def notify_creator(row, text, keyboard=None):
     logging.warning(f"Не найден user_id для @{creator_username}")
 
 
+DATE_RE = re.compile(r"\b(\d{1,2})\.(0?[1-9]|1[0-2])(?:\.(\d{4}))?\b")
+TIME_RE = re.compile(r"\b([01]?\d|2[0-3])[:.]([0-5]\d)\b")
+
+
+def _spans_overlap(a, b):
+    return a[0] < b[1] and b[0] < a[1]
+
+
+def find_time_match(text, ignored_spans=None):
+    """Ищет время формата 18:00 или 18.00, не путая его с датой 09.06."""
+    ignored_spans = ignored_spans or []
+
+    for match in TIME_RE.finditer(text):
+        if any(_spans_overlap(match.span(), span) for span in ignored_spans):
+            continue
+        return match
+
+    return None
+
+
+def format_time_match(match):
+    if not match:
+        return ""
+    hour = int(match.group(1))
+    minute = int(match.group(2))
+    return f"{hour:02d}:{minute:02d}"
+
+
+def extract_deadline_from_text(text):
+    """Достаёт дедлайн из свободного текста.
+
+    Поддерживает:
+    - сегодня / завтра
+    - сегодня 18:00 / завтра до 18:00
+    - 09.06 / 09.06 18:00 / 09.06 к 18:00
+    - только 18:00 — считается дедлайном на сегодня
+
+    Если время не указано, дальше parse_deadline_to_datetime поставит 23:59,
+    то есть старое поведение сохраняется.
+    """
+    if not text:
+        return "не указан"
+
+    raw_text = str(text).strip()
+    lower_text = raw_text.lower()
+    now = datetime.now()
+
+    date_matches = list(DATE_RE.finditer(raw_text))
+    time_match = find_time_match(raw_text, [m.span() for m in date_matches])
+    time_text = format_time_match(time_match)
+
+    if "сегодня" in lower_text:
+        date_text = now.strftime("%d.%m")
+    elif "завтра" in lower_text:
+        date_text = (now + timedelta(days=1)).strftime("%d.%m")
+    elif date_matches:
+        date_text = date_matches[0].group(0)
+    else:
+        date_text = ""
+
+    if date_text and time_text:
+        return f"{date_text} {time_text}"
+    if date_text:
+        return date_text
+    if time_text:
+        return f"{now.strftime('%d.%m')} {time_text}"
+
+    return "не указан"
+
+
+def clean_task_description(text, assignee, link):
+    description = text
+    description = description.replace(assignee, "")
+    if link:
+        description = description.replace(link, "")
+
+    date_matches = list(DATE_RE.finditer(description))
+    time_matches = []
+    for match in TIME_RE.finditer(description):
+        if any(_spans_overlap(match.span(), dm.span()) for dm in date_matches):
+            continue
+        time_matches.append(match)
+
+    description = DATE_RE.sub("", description)
+    # Убираем время отдельным проходом, чтобы не удалить дату 09.06 как время 09.06.
+    for match in reversed(time_matches):
+        start, end = match.span()
+        description = description[:start] + description[end:]
+
+    description = re.sub(
+        r"\b(до|к|в|дедлайн|задача|для|сегодня|завтра)\b",
+        "",
+        description,
+        flags=re.IGNORECASE,
+    )
+    description = re.sub(r"\s+", " ", description).strip(" :-—")
+
+    return description
+
+
 def parse_free_task(text):
     assignee_match = re.search(r"@[\w\d_]+", text)
     link_match = re.search(r"https?://\S+", text)
@@ -332,26 +432,8 @@ def parse_free_task(text):
 
     assignee = assignee_match.group(0)
     link = link_match.group(0) if link_match else ""
-
-    deadline = "не указан"
-
-    today = datetime.now()
-
-    if "сегодня" in text.lower():
-        deadline = today.strftime("%d.%m")
-    elif "завтра" in text.lower():
-        deadline = (today + timedelta(days=1)).strftime("%d.%m")
-    else:
-        date_match = re.search(r"\b\d{1,2}\.\d{1,2}(?:\.\d{4})?\b", text)
-        if date_match:
-            deadline = date_match.group(0)
-
-    description = text
-    description = description.replace(assignee, "")
-    if link:
-        description = description.replace(link, "")
-    description = re.sub(r"\b(до|к|дедлайн|задача|для)\b", "", description, flags=re.IGNORECASE)
-    description = re.sub(r"\s+", " ", description).strip(" :-—")
+    deadline = extract_deadline_from_text(text)
+    description = clean_task_description(text, assignee, link)
 
     return assignee, description, deadline, link
 
@@ -366,22 +448,31 @@ def parse_deadline_to_datetime(deadline_text):
     if text in ["не указан", "-", ""]:
         return None
 
+    date_matches = list(DATE_RE.finditer(text))
+    time_match = find_time_match(text, [m.span() for m in date_matches])
+
+    deadline_time = time(23, 59)
+    if time_match:
+        deadline_time = time(int(time_match.group(1)), int(time_match.group(2)))
+
     if "сегодня" in text:
-        return datetime.combine(now.date(), time(23, 59))
+        return datetime.combine(now.date(), deadline_time)
 
     if "завтра" in text:
-        return datetime.combine((now + timedelta(days=1)).date(), time(23, 59))
+        return datetime.combine((now + timedelta(days=1)).date(), deadline_time)
 
-    match = re.search(r"\b(\d{1,2})\.(\d{1,2})(?:\.(\d{4}))?\b", text)
-    if not match:
+    if not date_matches:
+        if time_match:
+            return datetime.combine(now.date(), deadline_time)
         return None
 
+    match = date_matches[0]
     day = int(match.group(1))
     month = int(match.group(2))
     year = int(match.group(3)) if match.group(3) else now.year
 
     try:
-        return datetime(year, month, day, 23, 59)
+        return datetime(year, month, day, deadline_time.hour, deadline_time.minute)
     except ValueError:
         return None
 
@@ -424,6 +515,8 @@ def get_message_content_text(message: Message):
         base = "📎 Голосовое сообщение приложено"
     elif message.video_note:
         base = "📎 Видеосообщение приложено"
+    elif getattr(message, "animation", None):
+        base = "📎 GIF/анимация приложена"
     else:
         return None
 
@@ -438,9 +531,64 @@ def get_submission_result_text(message: Message):
     return get_message_content_text(message)
 
 
+def get_message_task_text(message: Message):
+    """Текст задачи может быть обычным сообщением или подписью к файлу/медиа."""
+    if message.text:
+        return message.text.strip()
+    if message.caption:
+        return message.caption.strip()
+    return ""
+
+
+def has_copyable_attachment(message: Message):
+    """Есть ли в сообщении вложение, которое можно переслать/скопировать адресату."""
+    return any([
+        message.document,
+        message.photo,
+        message.video,
+        message.audio,
+        message.voice,
+        message.video_note,
+        getattr(message, "animation", None),
+    ])
+
+
+def get_attachment_material_text(message: Message):
+    """Короткая подпись материала задачи для Google Sheets и карточки задачи."""
+    if message.document:
+        return f"📎 Файл приложен: {message.document.file_name or 'документ'}"
+    if message.photo:
+        return "📎 Фото приложено"
+    if message.video:
+        return "📎 Видео приложено"
+    if message.audio:
+        return f"📎 Аудио приложено: {message.audio.file_name or 'аудио'}"
+    if message.voice:
+        return "📎 Голосовое сообщение приложено"
+    if message.video_note:
+        return "📎 Видеосообщение приложено"
+    if getattr(message, "animation", None):
+        return "📎 GIF/анимация приложена"
+    return ""
+
+
+def build_task_material_text(message: Message, link: str):
+    """Материал задачи: вложение, ссылка или оба варианта."""
+    attachment_text = get_attachment_material_text(message)
+    link = link.strip() if link else ""
+
+    if attachment_text and link:
+        return f"{attachment_text}\n🔗 Ссылка: {link}"
+    if attachment_text:
+        return attachment_text
+    if link:
+        return link
+    return ""
+
+
 async def copy_message_to_username(username, message: Message, header_text):
     """Копирует файл/медиа адресату по username. Для текстовых сообщений копирование не нужно."""
-    if message.text:
+    if not has_copyable_attachment(message):
         return False
 
     user_id = get_user_id_by_username(username)
@@ -518,6 +666,7 @@ async def change_task_status(row_number, row, task_id, new_status, actor_usernam
 
 async def create_task_from_parts(message, assignee, description, deadline, link):
     task_id = len(sheet.get_all_values())
+    material_text = build_task_material_text(message, link)
 
     row = [
         task_id,
@@ -525,7 +674,7 @@ async def create_task_from_parts(message, assignee, description, deadline, link)
         assignee,
         description,
         deadline,
-        link,
+        material_text,
         "❓ Ожидает подтверждения",
         "",
         "",
@@ -562,8 +711,14 @@ async def create_task_from_parts(message, assignee, description, deadline, link)
                 f"Поставил: @{norm_user(message.from_user.username)}\n"
                 f"Описание: {description}\n"
                 f"Дедлайн: {deadline}\n"
-                f"Материал: {link if link else 'не указан'}",
+                f"Материал: {material_text if material_text else 'не указан'}",
                 reply_markup=waiting_keyboard(task_id),
+            )
+
+            await copy_message_to_username(
+                assignee,
+                message,
+                f"📎 Материал к задаче #{task_id} от @{norm_user(message.from_user.username)}:",
             )
         except Exception as e:
             logging.warning(f"Не удалось отправить задачу исполнителю {assignee}: {e}")
@@ -616,9 +771,10 @@ async def create_task_command(message: Message):
         await message.answer(
             "Не понял задачу.\n\n"
             "Формат:\n"
-            "/задача @user описание | 09.06 | ссылка\n\n"
+            "/задача @user описание | 09.06 18:00 | ссылка\n\n"
             "Или свободно:\n"
-            "@user сделать обложку до завтра https://..."
+            "@user сделать обложку до завтра до 18:00 https://...\n\n"
+            "Можно также прикрепить файл/фото/видео и написать задачу в подписи."
         )
 
 
@@ -1046,7 +1202,7 @@ async def move_deadline(callback: CallbackQuery):
 
     await callback.message.answer(
         f"Напиши новый срок и причину переноса для задачи #{task_id}.\n\n"
-        f"Например:\n15.06 — жду материал"
+        f"Например:\n15.06 18:00 — жду материал"
     )
     await callback.answer()
 
@@ -1241,13 +1397,11 @@ async def approve_move(callback: CallbackQuery):
         return
 
     comment = row[8]
-    date_match = re.search(r"\b\d{1,2}\.\d{1,2}(?:\.\d{4})?\b", comment)
+    new_deadline = extract_deadline_from_text(comment)
 
-    if not date_match:
-        await callback.answer("Не нашёл новую дату в комментарии", show_alert=True)
+    if new_deadline == "не указан":
+        await callback.answer("Не нашёл новый срок в комментарии", show_alert=True)
         return
-
-    new_deadline = date_match.group(0)
 
     sheet.update_cell(row_number, 5, new_deadline)
     sheet.update_cell(row_number, 9, f"Перенос одобрен. Новый срок: {new_deadline}. {comment}")
@@ -1293,7 +1447,8 @@ async def reassign(callback: CallbackQuery):
 
 @dp.message()
 async def text_handler(message: Message):
-    logging.info(f"CHAT={message.chat.id} THREAD={message.message_thread_id} TEXT={message.text}")
+    incoming_task_text = get_message_task_text(message)
+    logging.info(f"CHAT={message.chat.id} THREAD={message.message_thread_id} TEXT={incoming_task_text}")
 
     if not is_allowed_message(message):
         return
@@ -1488,8 +1643,12 @@ async def text_handler(message: Message):
         user_states.pop(message.from_user.id, None)
         return
 
-    if message.text and "@" in message.text and not message.text.startswith("/"):
-        parsed = parse_free_task(message.text)
+    task_text_for_parse = incoming_task_text
+    if task_text_for_parse.startswith("/задача"):
+        task_text_for_parse = re.sub(r"^/задача(@\w+)?", "", task_text_for_parse).strip()
+
+    if task_text_for_parse and "@" in task_text_for_parse and not (incoming_task_text.startswith("/") and not incoming_task_text.startswith("/задача")):
+        parsed = parse_free_task(task_text_for_parse)
 
         if parsed:
             assignee, description, deadline, link = parsed
@@ -1500,12 +1659,16 @@ async def text_handler(message: Message):
                 deadline,
                 link
             )
-            await message.answer(f"✅ Создал задачу #{task_id}")
+            if has_copyable_attachment(message):
+                await message.answer(f"✅ Создал задачу #{task_id} и отправил вложение исполнителю")
+            else:
+                await message.answer(f"✅ Создал задачу #{task_id}")
             return
 
     await message.answer(
         "Я не понял сообщение.\n\n"
-        "Используй кнопки меню или напиши задачу с @исполнителем."
+        "Используй кнопки меню или напиши задачу с @исполнителем. "
+        "Файл/фото/видео можно прикрепить к сообщению и написать задачу в подписи."
     )
 
 
