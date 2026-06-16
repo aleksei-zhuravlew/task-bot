@@ -401,6 +401,107 @@ async def notify_user_by_username(username, text, keyboard=None):
         return False
 
 
+def get_submission_result_text(message: Message):
+    """Возвращает короткую запись результата для Google Sheets.
+    Сам файл не кладём в таблицу: он копируется автору задачи в Telegram.
+    """
+    if message.text:
+        return message.text.strip()
+
+    caption = message.caption.strip() if message.caption else ""
+
+    if message.document:
+        base = f"📎 Файл приложен: {message.document.file_name or 'документ'}"
+    elif message.photo:
+        base = "📎 Фото приложено"
+    elif message.video:
+        base = "📎 Видео приложено"
+    elif message.audio:
+        base = f"📎 Аудио приложено: {message.audio.file_name or 'аудио'}"
+    elif message.voice:
+        base = "📎 Голосовое сообщение приложено"
+    elif message.video_note:
+        base = "📎 Видеосообщение приложено"
+    else:
+        return None
+
+    if caption:
+        return f"{base}\nКомментарий: {caption}"
+
+    return base
+
+
+async def copy_submission_to_creator(row, message: Message, task_id):
+    """Копирует присланный файл/сообщение автору задачи.
+    Для текста копирование не нужно: текст уже уходит в уведомлении.
+    """
+    if message.text:
+        return
+
+    creator_username = norm_user(row[1])
+    creator_user_id = get_user_id_by_username(creator_username)
+
+    if not creator_user_id:
+        logging.warning(f"Не найден user_id автора @{creator_username} для копирования результата")
+        return
+
+    try:
+        await bot.send_message(
+            int(creator_user_id),
+            f"📎 Файл/медиа по задаче #{task_id} от {row[2]}:",
+        )
+        await bot.copy_message(
+            chat_id=int(creator_user_id),
+            from_chat_id=message.chat.id,
+            message_id=message.message_id,
+        )
+    except Exception as e:
+        logging.warning(f"Не удалось скопировать результат автору @{creator_username}: {e}")
+
+
+async def notify_status_change(row, task_id, old_status, new_status, actor_username=None):
+    """Уведомляет исполнителя, автора задачи и админов о любой смене статуса."""
+    if old_status == new_status:
+        return
+
+    actor = f"@{norm_user(actor_username)}" if actor_username else "бот"
+
+    text = (
+        f"🔔 Изменился статус задачи #{task_id}\n\n"
+        f"Было: {old_status}\n"
+        f"Стало: {new_status}\n\n"
+        f"👤 Автор: @{norm_user(row[1])}\n"
+        f"🧑‍💻 Исполнитель: {row[2]}\n"
+        f"📝 Описание: {row[3]}\n"
+        f"⏰ Дедлайн: {row[4]}\n"
+        f"Изменил: {actor}"
+    )
+
+    sent_user_ids = set()
+
+    async def send_once(username):
+        user_id = get_user_id_by_username(username)
+        if not user_id or user_id in sent_user_ids:
+            return
+        sent_user_ids.add(user_id)
+        try:
+            await bot.send_message(int(user_id), text)
+        except Exception as e:
+            logging.warning(f"Не удалось отправить уведомление о статусе @{norm_user(username)}: {e}")
+
+    await send_once(row[2])
+    await send_once(row[1])
+
+    for admin_username in get_admins():
+        await send_once(admin_username)
+
+
+async def change_task_status(row_number, row, task_id, new_status, actor_username=None):
+    """Единая точка смены статуса: обновляет таблицу и рассылает уведомления."""
+    old_status = row[6]
+    sheet.update_cell(row_number, 7, new_status)
+    await notify_status_change(row, task_id, old_status, new_status, actor_username)
+
 async def create_task_from_parts(message, assignee, description, deadline, link):
     task_id = len(sheet.get_all_values())
 
@@ -892,7 +993,7 @@ async def take_task(callback: CallbackQuery):
         await callback.answer("Эту задачу может взять только исполнитель", show_alert=True)
         return
 
-    sheet.update_cell(row_number, 7, "🔄 В работе")
+    await change_task_status(row_number, row, task_id, "🔄 В работе", callback.from_user.username)
     sheet.update_cell(row_number, 11, datetime.now().strftime("%d.%m.%Y %H:%M"))
 
     _, updated_row = find_task(task_id)
@@ -1003,7 +1104,7 @@ async def accept_task(callback: CallbackQuery):
         await callback.answer("Только автор задачи или редактор может принять работу", show_alert=True)
         return
 
-    sheet.update_cell(row_number, 7, "✅ Готово")
+    await change_task_status(row_number, row, task_id, "✅ Готово", callback.from_user.username)
     sheet.update_cell(row_number, 11, datetime.now().strftime("%d.%m.%Y %H:%M"))
 
     _, updated_row = find_task(task_id)
@@ -1100,7 +1201,7 @@ async def cancel_task(callback: CallbackQuery):
         await callback.answer("Отменить может только автор задачи или админ", show_alert=True)
         return
 
-    sheet.update_cell(row_number, 7, "❌ Отменена")
+    await change_task_status(row_number, row, task_id, "❌ Отменена", callback.from_user.username)
     sheet.update_cell(row_number, 11, datetime.now().strftime("%d.%m.%Y %H:%M"))
 
     _, updated_row = find_task(task_id)
@@ -1202,17 +1303,25 @@ async def text_handler(message: Message):
                 await message.answer("Сдать задачу может только исполнитель")
                 return
 
-            sheet.update_cell(row_number, 7, "⏳ На утверждении")
-            sheet.update_cell(row_number, 8, message.text)
+            result_text = get_submission_result_text(message)
+
+            if not result_text:
+                await message.answer("Пришли ссылку, текст, документ, фото, видео, аудио или голосовое сообщение")
+                return
+
+            await change_task_status(row_number, row, task_id, "⏳ На утверждении", message.from_user.username)
+            sheet.update_cell(row_number, 8, result_text)
             sheet.update_cell(row_number, 11, datetime.now().strftime("%d.%m.%Y %H:%M"))
 
             _, updated_row = find_task(task_id)
             await update_card(task_id, updated_row, None)
 
+            await copy_submission_to_creator(row, message, task_id)
+
             await message.answer(f"✅ Задача #{task_id} отправлена на утверждение")
             await notify_creator(
                 updated_row,
-                f"⏳ {row[2]} сдал задачу #{task_id}\nРезультат: {message.text}",
+                f"⏳ {row[2]} сдал задачу #{task_id}\nРезультат: {result_text}",
                 review_keyboard(task_id),
             )
 
@@ -1237,7 +1346,7 @@ async def text_handler(message: Message):
                 await message.answer("Отказаться может только исполнитель")
                 return
 
-            sheet.update_cell(row_number, 7, "⚠️ Требует переназначения")
+            await change_task_status(row_number, row, task_id, "⚠️ Требует переназначения", message.from_user.username)
             sheet.update_cell(row_number, 9, message.text)
             sheet.update_cell(row_number, 11, datetime.now().strftime("%d.%m.%Y %H:%M"))
 
@@ -1310,7 +1419,7 @@ async def text_handler(message: Message):
                 await message.answer("Правки может отправить только автор или админ")
                 return
 
-            sheet.update_cell(row_number, 7, "✏️ На доработке")
+            await change_task_status(row_number, row, task_id, "✏️ На доработке", message.from_user.username)
             sheet.update_cell(row_number, 9, message.text)
             sheet.update_cell(row_number, 11, datetime.now().strftime("%d.%m.%Y %H:%M"))
 
@@ -1331,7 +1440,8 @@ async def text_handler(message: Message):
                 return
 
             sheet.update_cell(row_number, 3, new_assignee)
-            sheet.update_cell(row_number, 7, "❓ Ожидает подтверждения")
+            row[2] = new_assignee
+            await change_task_status(row_number, row, task_id, "❓ Ожидает подтверждения", message.from_user.username)
             sheet.update_cell(row_number, 11, datetime.now().strftime("%d.%m.%Y %H:%M"))
 
             _, updated_row = find_task(task_id)
@@ -1428,7 +1538,7 @@ async def deadline_checker():
                     sheet.update_cell(index, REMINDER_1H_COL, "да")
 
                 if seconds_left <= 0 and overdue_notice_sent != "да":
-                    sheet.update_cell(index, 7, "🔴 Просрочена")
+                    await change_task_status(index, row, task_id, "🔴 Просрочена", "deadline_checker")
                     sheet.update_cell(index, 12, "да")
                     sheet.update_cell(index, OVERDUE_NOTICE_COL, "да")
                     sheet.update_cell(index, 11, datetime.now().strftime("%d.%m.%Y %H:%M"))
