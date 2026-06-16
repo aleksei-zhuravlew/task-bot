@@ -324,41 +324,187 @@ async def notify_creator(row, text, keyboard=None):
 
 
 DATE_RE = re.compile(r"\b(\d{1,2})\.(0?[1-9]|1[0-2])(?:\.(\d{4}))?\b")
-TIME_RE = re.compile(r"\b([01]?\d|2[0-3])[:.]([0-5]\d)\b")
+
+# Время теперь ищем не одним строгим regex, а несколькими вариантами:
+# 17:00, 17.00, 17-00, 17 00, 17ч00, 17ч, 17 часов,
+# до 17, к 17, в 17, 1700, 5 вечера, полдень, полночь.
+TIME_WITH_MINUTES_RE = re.compile(
+    r"(?<!\d)([01]?\d|2[0-4])\s*(?::|\.|-|–|—|ч\.?|час(?:а|ов)?|\s+)\s*([0-5]\d)(?!\d)",
+    re.IGNORECASE,
+)
+COMPACT_TIME_RE = re.compile(r"(?<!\d)([01]\d|2[0-3])([0-5]\d)(?!\d)")
+HOUR_WITH_CONTEXT_RE = re.compile(
+    r"\b(?:до|к|в|на|около|примерно)\s+([01]?\d|2[0-4])(?:\s*(?:ч\.?|час(?:а|ов)?)?)\b",
+    re.IGNORECASE,
+)
+HOUR_WITH_UNIT_RE = re.compile(
+    r"(?<!\d)([01]?\d|2[0-4])\s*(?:ч\.?|час(?:а|ов)?)\b",
+    re.IGNORECASE,
+)
+RUSSIAN_DAYTIME_RE = re.compile(
+    r"(?<!\d)(1[0-2]|0?[1-9])\s*(утра|дня|вечера|ночи)\b",
+    re.IGNORECASE,
+)
 
 
 def _spans_overlap(a, b):
     return a[0] < b[1] and b[0] < a[1]
 
 
-def find_time_match(text, ignored_spans=None):
-    """Ищет время формата 18:00 или 18.00, не путая его с датой 09.06."""
-    ignored_spans = ignored_spans or []
+def _normalize_time(hour, minute=0):
+    hour = int(hour)
+    minute = int(minute)
 
-    for match in TIME_RE.finditer(text):
-        if any(_spans_overlap(match.span(), span) for span in ignored_spans):
-            continue
-        return match
+    # Пользователи часто пишут «до 24:00» как «до конца дня».
+    # datetime.time не принимает 24:00, поэтому считаем это 23:59.
+    if hour == 24 and minute == 0:
+        return 23, 59
+
+    if 0 <= hour <= 23 and 0 <= minute <= 59:
+        return hour, minute
 
     return None
+
+
+def _make_time_candidate(hour, minute, span, score):
+    normalized = _normalize_time(hour, minute)
+    if not normalized:
+        return None
+
+    return {
+        "hour": normalized[0],
+        "minute": normalized[1],
+        "span": span,
+        "score": score,
+    }
+
+
+def _candidate_is_ignored(candidate, ignored_spans):
+    return any(_spans_overlap(candidate["span"], span) for span in ignored_spans)
+
+
+def _time_context_score(text, span):
+    """Даёт бонус времени, рядом с которым есть слова дедлайна."""
+    start, end = span
+    before = text[max(0, start - 15):start].lower()
+    after = text[end:min(len(text), end + 15)].lower()
+
+    score = 0
+    if re.search(r"(?:до|к|в|на|дедлайн|срок)\s*$", before):
+        score += 40
+    if re.search(r"^\s*(?:сегодня|завтра|дедлайн|срок)", after):
+        score += 25
+
+    return score
+
+
+def find_time_candidates(text, ignored_spans=None):
+    """Возвращает варианты времени, не путая их с датами вроде 09.06."""
+    ignored_spans = ignored_spans or []
+    candidates = []
+
+    def add(candidate):
+        if not candidate:
+            return
+        if _candidate_is_ignored(candidate, ignored_spans):
+            return
+        candidate["score"] += _time_context_score(text, candidate["span"])
+        candidates.append(candidate)
+
+    lower_text = text.lower()
+
+    for word, hour, minute in [
+        ("полдень", 12, 0),
+        ("полдня", 12, 0),
+        ("полудня", 12, 0),
+        ("полночь", 0, 0),
+        ("полночи", 0, 0),
+    ]:
+        for match in re.finditer(rf"\b{word}\b", lower_text):
+            add(_make_time_candidate(hour, minute, match.span(), 115))
+
+    for match in RUSSIAN_DAYTIME_RE.finditer(text):
+        hour = int(match.group(1))
+        part = match.group(2).lower()
+
+        if part == "вечера":
+            if hour < 12:
+                hour += 12
+        elif part == "дня":
+            if 1 <= hour <= 11:
+                hour += 12
+            if hour == 24:
+                hour = 12
+        elif part == "ночи":
+            if hour == 12:
+                hour = 0
+        # «утра» оставляем как есть.
+
+        add(_make_time_candidate(hour, 0, match.span(), 110))
+
+    for match in TIME_WITH_MINUTES_RE.finditer(text):
+        add(_make_time_candidate(match.group(1), match.group(2), match.span(), 100))
+
+    # Компактное «до 1700» или «к 0930» берём только при явном контексте,
+    # чтобы не ловить случайные четырёхзначные числа.
+    for match in COMPACT_TIME_RE.finditer(text):
+        before = text[max(0, match.start() - 8):match.start()].lower()
+        if re.search(r"(?:до|к|в|на)\s*$", before):
+            add(_make_time_candidate(match.group(1), match.group(2), match.span(), 95))
+
+    for match in HOUR_WITH_CONTEXT_RE.finditer(text):
+        add(_make_time_candidate(match.group(1), 0, match.span(), 80))
+
+    for match in HOUR_WITH_UNIT_RE.finditer(text):
+        add(_make_time_candidate(match.group(1), 0, match.span(), 75))
+
+    # Формат «20.06 17» или «20.06 в 17».
+    # Сюда передаются ignored_spans дат, поэтому аккуратно смотрим сразу после даты.
+    for date_span in ignored_spans:
+        after_start = date_span[1]
+        after = text[after_start:after_start + 25]
+        match = re.match(
+            r"\s*(?:до|к|в|на)?\s*([01]?\d|2[0-4])(?:\s*(?::|\.|-|–|—|ч\.?|\s+)\s*([0-5]\d))?\b",
+            after,
+            re.IGNORECASE,
+        )
+        if match:
+            minute = match.group(2) if match.group(2) is not None else 0
+            span = (after_start + match.start(1), after_start + match.end(0))
+            add(_make_time_candidate(match.group(1), minute, span, 90))
+
+    # Убираем дубли: например «17 00» может совпасть с «до 17».
+    unique = []
+    for candidate in sorted(candidates, key=lambda c: c["score"], reverse=True):
+        if any(_spans_overlap(candidate["span"], existing["span"]) for existing in unique):
+            continue
+        unique.append(candidate)
+
+    return sorted(unique, key=lambda c: c["score"], reverse=True)
+
+
+def find_time_match(text, ignored_spans=None):
+    candidates = find_time_candidates(text, ignored_spans)
+    return candidates[0] if candidates else None
 
 
 def format_time_match(match):
     if not match:
         return ""
-    hour = int(match.group(1))
-    minute = int(match.group(2))
-    return f"{hour:02d}:{minute:02d}"
+    return f"{match['hour']:02d}:{match['minute']:02d}"
 
 
 def extract_deadline_from_text(text):
     """Достаёт дедлайн из свободного текста.
 
-    Поддерживает:
+    Поддерживает старые и новые варианты:
     - сегодня / завтра
     - сегодня 18:00 / завтра до 18:00
-    - 09.06 / 09.06 18:00 / 09.06 к 18:00
-    - только 18:00 — считается дедлайном на сегодня
+    - до завтра до 17 00 / до 17 завтра / к 17 завтра
+    - 09.06 / 09.06 18:00 / 09.06 18 00 / 09.06 в 18
+    - 18:00 / 18.00 / 18-00 / 18 00 / 18ч / 18 часов
+    - 1700 при явном контексте: до 1700
+    - 5 вечера / полдень / полночь
 
     Если время не указано, дальше parse_deadline_to_datetime поставит 23:59,
     то есть старое поведение сохраняется.
@@ -393,6 +539,12 @@ def extract_deadline_from_text(text):
     return "не указан"
 
 
+def _remove_spans(text, spans):
+    for start, end in sorted(spans, reverse=True):
+        text = text[:start] + text[end:]
+    return text
+
+
 def clean_task_description(text, assignee, link):
     description = text
     description = description.replace(assignee, "")
@@ -400,25 +552,19 @@ def clean_task_description(text, assignee, link):
         description = description.replace(link, "")
 
     date_matches = list(DATE_RE.finditer(description))
-    time_matches = []
-    for match in TIME_RE.finditer(description):
-        if any(_spans_overlap(match.span(), dm.span()) for dm in date_matches):
-            continue
-        time_matches.append(match)
+    ignored_spans = [m.span() for m in date_matches]
+    time_candidates = find_time_candidates(description, ignored_spans)
 
-    description = DATE_RE.sub("", description)
-    # Убираем время отдельным проходом, чтобы не удалить дату 09.06 как время 09.06.
-    for match in reversed(time_matches):
-        start, end = match.span()
-        description = description[:start] + description[end:]
+    spans_to_remove = ignored_spans + [candidate["span"] for candidate in time_candidates]
+    description = _remove_spans(description, spans_to_remove)
 
     description = re.sub(
-        r"\b(до|к|в|дедлайн|задача|для|сегодня|завтра)\b",
+        r"\b(до|к|в|на|около|примерно|дедлайн|задача|для|сегодня|завтра|срок|час|часа|часов|ч)\b",
         "",
         description,
         flags=re.IGNORECASE,
     )
-    description = re.sub(r"\s+", " ", description).strip(" :-—")
+    description = re.sub(r"\s+", " ", description).strip(" :-—.,")
 
     return description
 
@@ -453,7 +599,7 @@ def parse_deadline_to_datetime(deadline_text):
 
     deadline_time = time(23, 59)
     if time_match:
-        deadline_time = time(int(time_match.group(1)), int(time_match.group(2)))
+        deadline_time = time(time_match["hour"], time_match["minute"])
 
     if "сегодня" in text:
         return datetime.combine(now.date(), deadline_time)
