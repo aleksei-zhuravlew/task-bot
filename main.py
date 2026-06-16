@@ -401,12 +401,14 @@ async def notify_user_by_username(username, text, keyboard=None):
         return False
 
 
-def get_submission_result_text(message: Message):
-    """Возвращает короткую запись результата для Google Sheets.
-    Сам файл не кладём в таблицу: он копируется автору задачи в Telegram.
+def get_message_content_text(message: Message):
+    """Возвращает короткое текстовое описание сообщения для Google Sheets и уведомлений.
+    Поддерживает текст, документы, фото, видео, аудио, голосовые и видеосообщения.
+    Сам файл не кладём в таблицу: при необходимости копируем сообщение адресату в Telegram.
     """
     if message.text:
-        return message.text.strip()
+        text = message.text.strip()
+        return text if text else None
 
     caption = message.caption.strip() if message.caption else ""
 
@@ -431,32 +433,44 @@ def get_submission_result_text(message: Message):
     return base
 
 
-async def copy_submission_to_creator(row, message: Message, task_id):
-    """Копирует присланный файл/сообщение автору задачи.
-    Для текста копирование не нужно: текст уже уходит в уведомлении.
-    """
+def get_submission_result_text(message: Message):
+    """Совместимость со старой логикой сдачи работы."""
+    return get_message_content_text(message)
+
+
+async def copy_message_to_username(username, message: Message, header_text):
+    """Копирует файл/медиа адресату по username. Для текстовых сообщений копирование не нужно."""
     if message.text:
-        return
+        return False
 
-    creator_username = norm_user(row[1])
-    creator_user_id = get_user_id_by_username(creator_username)
+    user_id = get_user_id_by_username(username)
 
-    if not creator_user_id:
-        logging.warning(f"Не найден user_id автора @{creator_username} для копирования результата")
-        return
+    if not user_id:
+        logging.warning(f"Не найден user_id для @{norm_user(username)} при копировании сообщения")
+        return False
 
     try:
-        await bot.send_message(
-            int(creator_user_id),
-            f"📎 Файл/медиа по задаче #{task_id} от {row[2]}:",
-        )
+        await bot.send_message(int(user_id), header_text)
         await bot.copy_message(
-            chat_id=int(creator_user_id),
+            chat_id=int(user_id),
             from_chat_id=message.chat.id,
             message_id=message.message_id,
         )
+        return True
     except Exception as e:
-        logging.warning(f"Не удалось скопировать результат автору @{creator_username}: {e}")
+        logging.warning(f"Не удалось скопировать сообщение @{norm_user(username)}: {e}")
+        return False
+
+
+async def copy_submission_to_creator(row, message: Message, task_id):
+    """Копирует присланный файл/медиа автору задачи.
+    Для текста копирование не нужно: текст уже уходит в уведомлении.
+    """
+    await copy_message_to_username(
+        row[1],
+        message,
+        f"📎 Файл/медиа по задаче #{task_id} от {row[2]}:",
+    )
 
 
 async def notify_status_change(row, task_id, old_status, new_status, actor_username=None):
@@ -1078,8 +1092,9 @@ async def help_task(callback: CallbackQuery):
     }
 
     await callback.message.answer(
-        f"🆘 Напиши, что именно нужно по задаче #{task_id}.\n\n"
-        f"Например: не хватает исходников, нужна редактура, нужен контакт героя."
+        f"🆘 Напиши, что именно нужно по задаче #{task_id}, или пришли файл/фото/видео/голосовое.\n\n"
+        f"Например: не хватает исходников, нужна редактура, нужен контакт героя.\n"
+        f"Если отправляешь файл, можно добавить подпись к нему."
     )
     await callback.answer()
 
@@ -1160,8 +1175,9 @@ async def admin_help(callback: CallbackQuery):
     }
 
     await callback.message.answer(
-        f"Напиши комментарий помощи по задаче #{task_id}.\n\n"
-        f"Я отправлю его исполнителю {row[2]}."
+        f"Напиши комментарий помощи по задаче #{task_id} или пришли файл/фото/видео/голосовое.\n\n"
+        f"Я отправлю это исполнителю {row[2]}.\n"
+        f"Если отправляешь файл, можно добавить подпись к нему."
     )
     await callback.answer()
 
@@ -1365,7 +1381,11 @@ async def text_handler(message: Message):
                 await message.answer("Запросить помощь может только исполнитель")
                 return
 
-            help_text = message.text.strip()
+            help_text = get_message_content_text(message)
+
+            if not help_text:
+                await message.answer("Пришли текст, документ, фото, видео, аудио или голосовое сообщение")
+                return
 
             old_comment = row[8] if row[8] else ""
             new_comment = f"{old_comment}\n🆘 Запрос помощи: {help_text}".strip()
@@ -1375,6 +1395,12 @@ async def text_handler(message: Message):
 
             _, updated_row = find_task(task_id)
             await update_card(task_id, updated_row, None)
+
+            await copy_message_to_username(
+                row[1],
+                message,
+                f"📎 Материал к запросу помощи по задаче #{task_id} от {row[2]}:",
+            )
 
             await message.answer("🆘 Запрос помощи отправлен автору задачи.")
 
@@ -1393,7 +1419,11 @@ async def text_handler(message: Message):
                 await message.answer("Ответить на запрос помощи может только автор или админ")
                 return
 
-            reply_text = message.text.strip()
+            reply_text = get_message_content_text(message)
+
+            if not reply_text:
+                await message.answer("Пришли текст, документ, фото, видео, аудио или голосовое сообщение")
+                return
 
             old_comment = row[8] if row[8] else ""
             new_comment = f"{old_comment}\n🤝 Ответ помощи от @{username}: {reply_text}".strip()
@@ -1404,6 +1434,12 @@ async def text_handler(message: Message):
             _, updated_row = find_task(task_id)
             await update_card(task_id, updated_row, None)
 
+            await copy_message_to_username(
+                row[2],
+                message,
+                f"📎 Материал помощи по задаче #{task_id} от @{username}:",
+            )
+
             await notify_user_by_username(
                 row[2],
                 f"🤝 ПОМОЩЬ ПО ЗАДАЧЕ\n\n"
@@ -1412,7 +1448,7 @@ async def text_handler(message: Message):
                 f"💬 Комментарий:\n{reply_text}",
             )
 
-            await message.answer(f"🤝 Комментарий отправлен исполнителю {row[2]}.")
+            await message.answer(f"🤝 Помощь отправлена исполнителю {row[2]}.")
 
         elif action == "rework":
             if username != creator and not is_admin(username):
