@@ -52,7 +52,9 @@ users_sheet = spreadsheet.worksheet("Users")
 def norm_user(username):
     if not username:
         return ""
-    return username.replace("@", "").strip()
+    # Telegram username не чувствителен к регистру, поэтому
+    # @Paul_Koff и @paul_koff должны считаться одним человеком.
+    return str(username).replace("@", "").strip().lower()
 
 
 def get_admins():
